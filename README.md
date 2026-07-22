@@ -190,6 +190,9 @@ sides implement the manifest `schema_version` they read and write, so their patc
 versions need not match. Publish from an image aligned with your target Airflow
 release rather than assuming an older CLI can write a newer schema.
 
+The full design — terms, storage layout, publication procedure, runtime operation,
+error contract, and extension plan — is in [docs/design.md](docs/design.md).
+
 ## Design notes: coexisting with stock Airflow
 
 An external bundle cannot change Airflow core, so several behaviors are designed around
