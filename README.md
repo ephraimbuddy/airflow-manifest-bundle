@@ -23,9 +23,8 @@ pip install .
 ```
 
 Requires Apache Airflow 3.1 or newer, detected at import time with no configuration:
-on Airflow 3.3+ `get_current_version` returns a `BundleVersion` whose data (manifest
-digest, file count, total size) is persisted on `DagVersion` rows; on 3.1/3.2 it
-returns the plain version string those releases expect.
+on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on 3.1/3.2 it returns
+the plain version string those releases expect.
 
 ## Configure
 
@@ -33,33 +32,146 @@ Bundles are discovered purely via Airflow config — no plugin registration:
 
 ```ini
 [dag_processor]
+dag_bundle_storage_path = /var/lib/airflow/dag-bundle-cache
 dag_bundle_config_list = [
     {
       "name": "my_dags",
       "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
-      "kwargs": {"published_root": "/shared/dag-releases"}
+      "kwargs": {"published_root": "/shared/dag-releases", "refresh_interval": 30}
     }
   ]
 ```
 
-`published_root` must be a shared filesystem path visible to the dag processor, workers,
-and the publisher, and must not overlap `dag_bundle_storage_path` (Airflow's cache).
+or the environment-variable equivalents (`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST`,
+`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`).
+
+Keep three locations separate and non-overlapping:
+
+- **the Dag source tree** — mutable, only ever read by the publisher command
+- **`published_root`** — the authoritative publication area, a shared filesystem path
+  readable by the dag processor, workers, and the publisher
+- **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
+
+The bundle never scans a source directory at runtime, and editing source files changes
+nothing until the next publish: Airflow only follows the release reference.
 
 ## Publish a release
 
+The source directory is supplied only to the publisher:
+
 ```bash
-airflow-manifest-bundle publish-local my_dags /path/to/dag/source
+airflow-manifest-bundle publish-local my_dags /path/to/dag/source --output json
 ```
 
-- Publishing identical content is **idempotent** (same content hash, no new snapshot).
-- Concurrent publishers serialize through a shared lock under `published_root`.
-- Deploy systems that can finish out of order can pass
-  `--expected-current-version sha256-<hex>` to refuse a stale update.
-- A failed publication leaves the previous release active: the release reference
-  (`refs/<bundle>/latest.json`) is updated atomically as the last step.
+The publisher builds a deterministic manifest of the source tree (ignoring `.git`,
+`__pycache__`, and `*.pyc`), then writes under `published_root`:
+
+```text
+versions/my_dags/sha256-<hex>/            immutable snapshot (read-only, world-readable)
+    <your dag files>
+    .airflow-bundle-manifest.json         full manifest embedded in the snapshot
+refs/my_dags/latest.json                  compact release reference — updated last, atomically
+_locks/my_dags.lock                       cross-host publication lock
+```
+
+The version is the SHA-256 content hash of the manifest entries, and the `--output json`
+result reports it along with `version_path`, `manifest_ref_path`, `file_count`,
+`total_size`, and `created_snapshot`. Airflow validates and copies the referenced
+snapshot into its own cache before parsing or execution; stale-cache cleanup may delete
+that copy, and initialization rematerializes it from `published_root`.
 
 The publisher and the Airflow runtime can run as different OS users: snapshots are
-world-readable and read-only.
+world-readable and read-only. The publisher chmods only directories it creates — a
+pre-provisioned `published_root` keeps its permissions, so make it readable by the
+Airflow components.
+
+## Deploying from CI/CD
+
+Publishing is designed to be the last step of a deploy pipeline. The job needs the
+package and Airflow installed, the bundle config visible (env vars are enough), and the
+shared filesystem mounted — **no metadata database access is required to publish**.
+
+```yaml
+# Sketch for any CI system; shown as a GitHub Actions job on a runner that
+# mounts /shared/dag-releases.
+deploy-dags:
+  runs-on: [self-hosted, dag-deployer]
+  env:
+    AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >
+      [{"name": "my_dags",
+        "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
+        "kwargs": {"published_root": "/shared/dag-releases"}}]
+  steps:
+    - uses: actions/checkout@v4
+    - run: pip install "apache-airflow==<your Airflow version>" airflow-manifest-bundle
+
+    # Capture the released version FIRST: it is the optimistic-concurrency token that
+    # stops an older pipeline run from clobbering a newer release at the end.
+    - name: Capture current release
+      run: echo "EXPECTED=$(jq -r .version /shared/dag-releases/refs/my_dags/latest.json)" >> "$GITHUB_ENV"
+
+    - name: Test Dags before publishing
+      run: pytest tests/dag_integrity/   # import checks, policy checks, etc.
+
+    - name: Publish
+      run: |
+        airflow-manifest-bundle publish-local my_dags ./dags \
+          --expected-current-version "$EXPECTED" --output json | tee release.json
+```
+
+Omit `--expected-current-version` only on the very first publication (with nothing to
+compare against, the publisher refuses the flag with a clear error).
+
+Properties that make this safe to automate:
+
+- **Idempotent** — republishing identical content computes the same version, creates no
+  new snapshot (`created_snapshot: false`), and simply confirms the reference.
+- **Atomic and fail-safe** — the reference is replaced last via an atomic rename; a
+  publish that dies at any earlier point leaves the previous release fully active.
+- **Serialized** — concurrent publishers queue on the shared lock under `published_root`.
+- **Ordered** — `--expected-current-version` makes a stale pipeline fail loudly instead
+  of rolling the reference backward.
+
+**Rollback** is just publishing the previous source again:
+
+```bash
+git checkout <last-good-ref>
+airflow-manifest-bundle publish-local my_dags ./dags \
+  --expected-current-version "$BAD_VERSION"
+```
+
+Content-addressing makes this instant when the old snapshot still exists under
+`published_root`: nothing is copied, the reference moves back.
+
+**Retention**: Airflow never deletes from `published_root` — pruning old
+`versions/<bundle>/sha256-*` directories is a deliberate operation you schedule
+yourself, and it must keep any version that a Dag run can still request (retries,
+reruns, deferred tasks, callbacks pin by version).
+
+## Verify a deployment
+
+From any host with the Airflow config above and an initialized metadata database
+(the CLI insists on `airflow db migrate` having run, even for local parsing):
+
+```bash
+airflow dags list --local --bundle-name my_dags --output table
+airflow dags list-import-errors --local --bundle-name my_dags --output table
+```
+
+`--local` parses straight from the bundle (no scheduler needed) and reads the
+materialized cache copy — never the source tree. Editing source files without
+publishing changes nothing; after a publish, the same command shows the new Dags.
+Persisted `DagVersion.bundle_version` values match the published version string.
+
+Two operational notes: if the release reference is missing, initialization fails with
+an error telling you to run the publisher; and the per-host `.sha256-<hex>.validated`
+marker files next to cache entries let repeat validations skip the checksum pass —
+delete them to force a full re-validation.
+
+The on-disk files are the compatibility contract between publisher and runtime: both
+sides implement the manifest `schema_version` they read and write, so their patch
+versions need not match. Publish from an image aligned with your target Airflow
+release rather than assuming an older CLI can write a newer schema.
 
 ## Design notes: coexisting with stock Airflow
 
