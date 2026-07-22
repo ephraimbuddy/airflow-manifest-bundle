@@ -27,9 +27,9 @@ from unittest import mock
 
 import pytest
 
-from airflow_manifest_bundle import bundle as local_bundle_module
+from airflow_manifest_bundle import local as local_bundle_module
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
-from airflow_manifest_bundle.bundle import (
+from airflow_manifest_bundle.local import (
     BundleManifestReferenceChangedError,
     ManifestLocalDagBundle,
     publish_manifest_local_dag_bundle,
@@ -649,7 +649,7 @@ class TestManifestLocalDagBundle:
             # The marker skips only the hashing pass; the structural pass still runs so
             # that truncated or mutated cache trees are detected and rebuilt.
             with mock.patch(
-                "airflow_manifest_bundle.bundle.compute_file_sha256",
+                "airflow_manifest_bundle.local.compute_file_sha256",
                 side_effect=AssertionError("marker must skip the hashing pass"),
             ):
                 fresh_bundle.initialize()
@@ -670,7 +670,7 @@ class TestManifestLocalDagBundle:
             _write_file(orphan, "dags/leftover.py", "print('leftover')")
 
             with mock.patch(
-                "airflow_manifest_bundle.bundle.remove_bundle_tree_forcefully",
+                "airflow_manifest_bundle.local.remove_bundle_tree_forcefully",
                 autospec=True,
                 side_effect=PermissionError("operation not permitted"),
             ):

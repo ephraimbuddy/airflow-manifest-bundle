@@ -3,7 +3,7 @@
 A manifest-backed local Dag bundle for Apache Airflow — pip-install it, point your
 bundle config at it, and it works with any standard Airflow 3.1+ installation.
 
-The stock `LocalDagBundle` cannot identify the exact source files a task retry or rerun
+The Airflow `LocalDagBundle` cannot identify the exact source files a task retry or rerun
 used: files can change after a Dag run is created, so its bundle version resolves nothing.
 `ManifestLocalDagBundle` gives shared-filesystem deployments reproducible pinned execution
 without requiring Git — it works like `GitDagBundle` does for commits:
@@ -36,7 +36,7 @@ dag_bundle_storage_path = /var/lib/airflow/dag-bundle-cache
 dag_bundle_config_list = [
     {
       "name": "my_dags",
-      "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
+      "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
       "kwargs": {"published_root": "/shared/dag-releases", "refresh_interval": 30}
     }
   ]
@@ -116,7 +116,7 @@ deploy-dags:
   env:
     AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >
       [{"name": "my_dags",
-        "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
+        "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
         "kwargs": {"published_root": "/shared/dag-releases"}}]
   steps:
     - uses: actions/checkout@v4

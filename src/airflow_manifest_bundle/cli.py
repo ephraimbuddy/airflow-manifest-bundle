@@ -34,7 +34,7 @@ from pathlib import Path
 def _get_manifest_local_bundle(bundle_name: str, *, action: str):
     from airflow.dag_processing.bundles.manager import DagBundlesManager
 
-    from airflow_manifest_bundle.bundle import ManifestLocalDagBundle
+    from airflow_manifest_bundle.local import ManifestLocalDagBundle
 
     bundle = DagBundlesManager().get_bundle(bundle_name)
     if not isinstance(bundle, ManifestLocalDagBundle):
@@ -47,7 +47,7 @@ def _get_manifest_local_bundle(bundle_name: str, *, action: str):
 
 def publish_local(args: argparse.Namespace) -> None:
     """Publish an immutable local snapshot for a manifest-backed local Dag bundle."""
-    from airflow_manifest_bundle.bundle import publish_manifest_local_dag_bundle
+    from airflow_manifest_bundle.local import publish_manifest_local_dag_bundle
 
     bundle = _get_manifest_local_bundle(args.bundle_name, action="published")
     result = publish_manifest_local_dag_bundle(

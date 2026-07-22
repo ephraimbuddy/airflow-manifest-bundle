@@ -36,7 +36,7 @@ def test_publish_local_command(tmp_path, capsys):
     config = [
         {
             "name": "manifest-local",
-            "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
+            "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
             "kwargs": {"published_root": str(published_root)},
         }
     ]
@@ -119,7 +119,7 @@ def test_publish_local_command_reports_stale_expected_version(tmp_path, capsys):
     config = [
         {
             "name": "manifest-local",
-            "classpath": "airflow_manifest_bundle.bundle.ManifestLocalDagBundle",
+            "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
             "kwargs": {"published_root": str(published_root)},
         }
     ]
