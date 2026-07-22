@@ -28,7 +28,7 @@ from unittest import mock
 import pytest
 
 from airflow_manifest_bundle import bundle as local_bundle_module
-from airflow_manifest_bundle._compat import BundleVersion, remove_bundle_tree_forcefully
+from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
     BundleManifestReferenceChangedError,
     ManifestLocalDagBundle,
@@ -58,9 +58,9 @@ def _version_string(result) -> str:
     return getattr(result, "version", result)
 
 
-def _write_manifest_ref(manifest_ref_path: Path, version_data: dict) -> None:
+def _write_manifest_ref(manifest_ref_path: Path, ref_payload: dict) -> None:
     manifest_ref_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_ref_path.write_bytes(serialize_bundle_version_manifest(version_data))
+    manifest_ref_path.write_bytes(serialize_bundle_version_manifest(ref_payload))
 
 
 def _add_write_bits(path: Path) -> None:
@@ -89,7 +89,7 @@ def _publish_manifest_local_bundle(
         root=source,
         backend_type="local",
     )
-    _write_manifest_ref(bundle.manifest_ref_path, result.version_data)
+    _write_manifest_ref(bundle.manifest_ref_path, result.ref_payload)
     return result
 
 
@@ -153,14 +153,8 @@ class TestManifestLocalDagBundle:
         bundle_version = bundle.get_current_version()
 
         assert _version_string(bundle_version) == published.version
-        if BundleVersion is not None:
-            # Airflow 3.3+ receives the manifest metadata and persists it on DagVersion rows.
-            assert bundle_version.data == published.version_data
-            assert "files" not in bundle_version.data
-            assert bundle_version.data["manifest"]["path"] == MANIFEST_FILE_NAME
-        else:
-            # Airflow 3.1/3.2 only understand plain string versions.
-            assert isinstance(bundle_version, str)
+        # The version string is the whole contract: no metadata flows through Airflow.
+        assert getattr(bundle_version, "data", None) is None
 
     def test_path_and_get_current_version_do_not_materialize_snapshots(self, tmp_path):
         missing_version = f"sha256-{'0' * 64}"
@@ -251,7 +245,7 @@ class TestManifestLocalDagBundle:
             assert first.version == second.version
             assert first.created_snapshot is True
             assert second.created_snapshot is False
-            assert json.loads(bundle.manifest_ref_path.read_text()) == second.version_data
+            assert json.loads(bundle.manifest_ref_path.read_text()) == second.ref_payload
             assert not stat.S_IMODE(second.version_path.stat().st_mode) & 0o222
             assert not (bundle.versions_dir / (second.version)).exists()
 
@@ -421,9 +415,9 @@ class TestManifestLocalDagBundle:
         def record_fsync_directory(path):
             calls.append(("fsync_directory", Path(path)))
 
-        def record_write_manifest_ref_atomically(manifest_ref_path, version_data):
+        def record_write_manifest_ref_atomically(manifest_ref_path, ref_payload):
             calls.append(("write_manifest_ref", Path(manifest_ref_path)))
-            real_write_manifest_ref_atomically(manifest_ref_path, version_data)
+            real_write_manifest_ref_atomically(manifest_ref_path, ref_payload)
 
         monkeypatch.setattr(local_bundle_module, "_fsync_directory", record_fsync_directory)
         monkeypatch.setattr(
@@ -553,38 +547,16 @@ class TestManifestLocalDagBundle:
             published_root = tmp_path / "published"
             bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(published_root))
             published = _publish_manifest_local_bundle(bundle, source)
-            # version_data is accepted (newer Airflow passes it when constructing pinned
-            # bundles) but ignored; validation uses the snapshot's own manifest.
             pinned_bundle = ManifestLocalDagBundle(
                 name="manifest-local",
                 published_root=str(published_root),
                 version=published.version,
-                version_data=published.version_data,
             )
             pinned_bundle.initialize()
 
             assert _version_string(pinned_bundle.get_current_version()) == published.version
             assert pinned_bundle.path == bundle.versions_dir / (published.version)
             assert (pinned_bundle.path / "dags/example.py").read_text() == "print('dag')"
-
-    def test_pinned_bundle_without_version_data_validates_snapshot_manifest(self, tmp_path):
-        source = tmp_path / "source"
-        _write_file(source, "dags/example.py", "print('dag')")
-
-        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
-            published_root = tmp_path / "published"
-            bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(published_root))
-            published = _publish_manifest_local_bundle(bundle, source)
-
-            pinned_bundle = ManifestLocalDagBundle(
-                name="manifest-local",
-                published_root=str(published_root),
-                version=published.version,
-            )
-            pinned_bundle.initialize()
-
-            assert pinned_bundle.path == bundle.versions_dir / (published.version)
-            assert _version_string(pinned_bundle.get_current_version()) == published.version
 
     def test_pinned_bundle_rematerializes_deleted_cache(self, tmp_path):
         source = tmp_path / "source"
@@ -855,7 +827,7 @@ class TestManifestLocalDagBundle:
                 published_root=str(tmp_path / "published"),
             )
             published = _publish_manifest_local_bundle(bundle, source)
-            payload = dict(published.version_data)
+            payload = dict(published.ref_payload)
             payload["backend"] = dict(payload["backend"])
             payload["manifest"] = dict(payload["manifest"])
             mutate(payload)
@@ -964,7 +936,7 @@ class TestManifestLocalDagBundle:
                 published_root=str(tmp_path / "published"),
             )
             published = _publish_manifest_local_bundle(bundle, source)
-            payload = dict(published.version_data)
+            payload = dict(published.ref_payload)
             payload["manifest"] = dict(payload["manifest"])
             payload["manifest"]["sha256"] = "sha256:bad"
             _write_manifest_ref(bundle.manifest_ref_path, payload)

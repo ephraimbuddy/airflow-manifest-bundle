@@ -95,7 +95,7 @@ class BundleVersionManifest:
 
     version: str
     manifest: dict[str, Any]
-    version_data: dict[str, Any]
+    ref_payload: dict[str, Any]
     source_snapshot: BundleSourceSnapshot
 
 
@@ -260,7 +260,7 @@ def _ensure_source_file_unchanged(source_file: BundleSourceFile) -> None:
         )
 
 
-def build_version_data(
+def build_ref_payload(
     *,
     bundle_name: str,
     version: str,
@@ -272,8 +272,7 @@ def build_version_data(
     """
     Build the compact release-reference payload; the one place that defines its schema.
 
-    This is the package's own latest.json format, independent of any Airflow plumbing —
-    the name predates that distinction and is kept for API stability.
+    This is the package's own latest.json format, independent of any Airflow plumbing.
     """
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -289,9 +288,9 @@ def build_version_data(
     }
 
 
-def _build_version_data(manifest: dict[str, Any]) -> dict[str, Any]:
+def _build_ref_payload(manifest: dict[str, Any]) -> dict[str, Any]:
     manifest_sha256 = hashlib.sha256(serialize_bundle_version_manifest(manifest)).hexdigest()
-    return build_version_data(
+    return build_ref_payload(
         bundle_name=manifest["bundle_name"],
         version=manifest["version"],
         backend=manifest["backend"],
@@ -347,7 +346,7 @@ def build_bundle_version_manifest_result(
     return BundleVersionManifest(
         version=version,
         manifest=manifest,
-        version_data=_build_version_data(manifest),
+        ref_payload=_build_ref_payload(manifest),
         source_snapshot=source_snapshot,
     )
 

@@ -44,7 +44,7 @@ from airflow_manifest_bundle.manifest import (
     BundleManifestNotFoundError,
     BundleManifestSourceChangedError,
     build_bundle_version_manifest_result,
-    build_version_data,
+    build_ref_payload,
     collect_bundle_source_snapshot,
     compute_bundle_version,
     compute_file_sha256,
@@ -84,7 +84,7 @@ class LocalBundleManifestRef:
     """Compact pointer to an immutable local bundle manifest."""
 
     version: str
-    version_data: dict[str, Any]
+    ref_payload: dict[str, Any]
     manifest_sha256: str
 
 
@@ -94,7 +94,7 @@ class LocalBundlePublishResult:
 
     bundle_name: str
     version: str
-    version_data: dict[str, Any]
+    ref_payload: dict[str, Any]
     version_path: Path
     manifest_ref_path: Path
     manifest_sha256: str
@@ -124,14 +124,8 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self,
         *,
         published_root: str | None = None,
-        version_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
-        # version_data is accepted so Airflow versions that pass it back when constructing
-        # pinned bundles keep working, but deliberately unused: pinned runs validate
-        # against the snapshot's own self-certifying manifest (the version IS the content
-        # hash of its entries), so the bundle also runs on releases without version_data.
-        del version_data
         # TypeError, not ValueError: stock prepare_callback_bundle swallows ValueError from
         # bundle construction as "Bundle no longer configured", silently dropping callbacks
         # with a misleading log. TypeError matches how every other bundle class fails on a
@@ -161,16 +155,15 @@ class ManifestLocalDagBundle(BaseDagBundle):
         """
         Current version: a ``BundleVersion`` on Airflow 3.3+, a plain string on 3.1/3.2.
 
-        On 3.3+ the manifest metadata (digest, file count, total size) rides along as
-        ``BundleVersion.data`` and is persisted on DagVersion rows. Pinned bundles return
-        just the version: the pinned snapshot is self-certifying, so no metadata lookup
-        is needed (or reliable — the release reference may have moved on).
+        The version string alone is the whole contract: it is the content hash of the
+        snapshot's manifest entries, so a pinned snapshot is self-certifying and no
+        side-channel metadata needs to flow through Airflow.
         """
         if self.version:
             return make_bundle_version(self.version)
         with _oserror_as_manifest_error():
             manifest_ref = self._ensure_current_manifest_ref()
-        return make_bundle_version(manifest_ref.version, manifest_ref.version_data)
+        return make_bundle_version(manifest_ref.version)
 
     def initialize(self) -> None:
         if self.version:
@@ -468,7 +461,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
                 f"Local bundle manifest reference {source} does not contain a valid total_size"
             )
 
-        version_data = build_version_data(
+        ref_payload = build_ref_payload(
             bundle_name=bundle_name,
             version=version,
             backend={"type": LOCAL_MANIFEST_BACKEND_TYPE},
@@ -478,7 +471,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
         )
         return LocalBundleManifestRef(
             version=version,
-            version_data=version_data,
+            ref_payload=ref_payload,
             manifest_sha256=manifest_sha256,
         )
 
@@ -501,8 +494,8 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self._validate_snapshot_manifest(
             snapshot_manifest,
             expected_version=manifest_ref.version,
-            expected_file_count=manifest_ref.version_data["file_count"],
-            expected_total_size=manifest_ref.version_data["total_size"],
+            expected_file_count=manifest_ref.ref_payload["file_count"],
+            expected_total_size=manifest_ref.ref_payload["total_size"],
         )
         verify_bundle_version_manifest(snapshot_manifest, manifest_ref.manifest_sha256)
         self._validate_snapshot_files(snapshot_manifest, version_path, check_content=check_content)
@@ -872,7 +865,7 @@ def publish_manifest_local_dag_bundle(
             root=source_path,
             backend_type=LOCAL_MANIFEST_BACKEND_TYPE,
         )
-        manifest_ref = bundle._manifest_ref_from_payload(manifest_result.version_data, source="publisher")
+        manifest_ref = bundle._manifest_ref_from_payload(manifest_result.ref_payload, source="publisher")
         version_path = bundle.published_versions_dir / manifest_result.version
 
         _remove_orphaned_local_manifest_temp_snapshots(bundle.published_versions_dir)
@@ -896,17 +889,17 @@ def publish_manifest_local_dag_bundle(
             raise BundleManifestSourceChangedError(
                 "Bundle source changed while publishing the local bundle snapshot"
             )
-        _write_manifest_ref_atomically(bundle.manifest_ref_path, manifest_result.version_data)
+        _write_manifest_ref_atomically(bundle.manifest_ref_path, manifest_result.ref_payload)
 
     return LocalBundlePublishResult(
         bundle_name=bundle.name,
         version=manifest_result.version,
-        version_data=manifest_result.version_data,
+        ref_payload=manifest_result.ref_payload,
         version_path=version_path,
         manifest_ref_path=bundle.manifest_ref_path,
         manifest_sha256=manifest_ref.manifest_sha256,
-        file_count=manifest_result.version_data["file_count"],
-        total_size=manifest_result.version_data["total_size"],
+        file_count=manifest_result.ref_payload["file_count"],
+        total_size=manifest_result.ref_payload["total_size"],
         created_snapshot=created_snapshot,
     )
 
@@ -1015,7 +1008,7 @@ def _remove_orphaned_manifest_ref_temp_files(manifest_ref_path: Path) -> None:
             path.unlink()
 
 
-def _write_manifest_ref_atomically(manifest_ref_path: Path, version_data: dict[str, Any]) -> None:
+def _write_manifest_ref_atomically(manifest_ref_path: Path, ref_payload: dict[str, Any]) -> None:
     manifest_ref_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{manifest_ref_path.name}.",
@@ -1024,7 +1017,7 @@ def _write_manifest_ref_atomically(manifest_ref_path: Path, version_data: dict[s
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as file:
-            file.write(serialize_bundle_version_manifest(version_data))
+            file.write(serialize_bundle_version_manifest(ref_payload))
             file.flush()
             # mkstemp creates the file owner-only; consumers can run as a different OS user.
             os.fchmod(file.fileno(), 0o644)

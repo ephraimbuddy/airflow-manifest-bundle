@@ -187,7 +187,7 @@ def test_manifest_paths_are_relative_and_sorted(tmp_path):
     assert str(source) not in json.dumps(manifest)
 
 
-def test_version_data_is_compact_and_points_to_manifest(tmp_path):
+def test_ref_payload_is_compact_and_points_to_manifest(tmp_path):
     source = tmp_path / "source"
     _write_file(source, "dags/example.py", "print('dag')")
 
@@ -195,18 +195,18 @@ def test_version_data_is_compact_and_points_to_manifest(tmp_path):
         bundle_name="manifest-local", root=source, backend_type="local"
     )
 
-    assert result.version_data == {
+    assert result.ref_payload == {
         "schema_version": 1,
         "bundle_name": "manifest-local",
         "version": result.version,
         "backend": {"type": "local"},
         "manifest": {
             "path": MANIFEST_FILE_NAME,
-            "sha256": result.version_data["manifest"]["sha256"],
+            "sha256": result.ref_payload["manifest"]["sha256"],
         },
         "file_count": 1,
         "total_size": len("print('dag')"),
     }
-    assert result.version_data["manifest"]["sha256"].startswith("sha256:")
-    assert "files" not in result.version_data
-    assert str(source) not in json.dumps(result.version_data)
+    assert result.ref_payload["manifest"]["sha256"].startswith("sha256:")
+    assert "files" not in result.ref_payload
+    assert str(source) not in json.dumps(result.ref_payload)

@@ -36,16 +36,16 @@ except ImportError:  # Airflow 3.1/3.2: get_current_version returns a plain stri
     BundleVersion = None  # type: ignore[assignment,misc]
 
 
-def make_bundle_version(version: str, data: dict[str, Any] | None = None) -> Any:
+def make_bundle_version(version: str) -> Any:
     """
-    Return ``version`` in the richest form the installed Airflow understands.
+    Return ``version`` in the form the installed Airflow expects.
 
     Airflow 3.3+ expects a ``BundleVersion`` (a bare string from a versioned bundle
-    triggers a deprecation warning) and persists its ``data`` on DagVersion rows;
-    3.1/3.2 only know plain strings, so ``data`` is dropped there.
+    triggers a deprecation warning); 3.1/3.2 only know plain strings. The ``data``
+    field stays None — the content-hash version string is the whole contract.
     """
     if BundleVersion is not None:
-        return BundleVersion(version=version, data=data)
+        return BundleVersion(version=version, data=None)
     return version
 
 
