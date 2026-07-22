@@ -85,15 +85,32 @@ world-readable and read-only. The publisher chmods only directories it creates �
 pre-provisioned `published_root` keeps its permissions, so make it readable by the
 Airflow components.
 
-## Deploying from CI/CD
+## Deploying: the publish command is the deploy
 
-Publishing is designed to be the last step of a deploy pipeline. The job needs the
-package and Airflow installed, the bundle config visible (env vars are enough), and the
-shared filesystem mounted — **no metadata database access is required to publish**.
+With a plain dags folder, "deploy" happens implicitly the moment files land in the
+folder — Airflow can see half-synced state, and a retry can pick up files that changed
+after the run started. With this bundle, copying files deploys nothing. Your existing
+workflow stays the same — edit, push, let your deploy tool deliver the files — and
+gains exactly one command at the end:
+
+```bash
+airflow-manifest-bundle publish-local my_dags ./dags
+```
+
+That command **is** the deploy: it snapshots the source and atomically flips the
+release reference, and until it runs, Airflow keeps serving the previous release no
+matter what is happening in the source directory. Anything can run it — a person over
+ssh, a deploy script, a CI job — as long as the host has the package and Airflow
+installed, the bundle config visible (env vars are enough), and `published_root`
+mounted. **No metadata database access is required to publish.**
+
+### Optional hardening for automated pipelines
+
+Nothing below is required by the bundle. If deploys are automated and can overlap,
+two additions make them safe; shown as a CI job sketch (any CI system works — the
+runner just needs `/shared/dag-releases` mounted):
 
 ```yaml
-# Sketch for any CI system; shown as a GitHub Actions job on a runner that
-# mounts /shared/dag-releases.
 deploy-dags:
   runs-on: [self-hosted, dag-deployer]
   env:
@@ -122,7 +139,7 @@ deploy-dags:
 Omit `--expected-current-version` only on the very first publication (with nothing to
 compare against, the publisher refuses the flag with a clear error).
 
-Properties that make this safe to automate:
+Properties that make publishing safe to automate:
 
 - **Idempotent** — republishing identical content computes the same version, creates no
   new snapshot (`created_snapshot: false`), and simply confirms the reference.
