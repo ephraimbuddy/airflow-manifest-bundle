@@ -33,6 +33,11 @@ dependencies = [
     "apache-airflow>=3.1.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ephraimbuddy/airflow-manifest-bundle"
+Repository = "https://github.com/ephraimbuddy/airflow-manifest-bundle"
+Issues = "https://github.com/ephraimbuddy/airflow-manifest-bundle/issues"
+
 [project.scripts]
 airflow-manifest-bundle = "airflow_manifest_bundle.cli:main"
 
