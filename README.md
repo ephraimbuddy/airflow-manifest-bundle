@@ -1,7 +1,7 @@
 # airflow-manifest-bundle
 
-A manifest-backed local Dag bundle for Apache Airflow — a standalone, pip-installable
-package that runs on unpatched Airflow.
+A manifest-backed local Dag bundle for Apache Airflow — pip-install it, point your
+bundle config at it, and it works with any standard Airflow 3.1+ installation.
 
 The stock `LocalDagBundle` cannot identify the exact source files a task retry or rerun
 used: files can change after a Dag run is created, so its bundle version resolves nothing.
