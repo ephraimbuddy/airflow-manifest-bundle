@@ -7,9 +7,26 @@ name = "airflow-manifest-bundle"
 version = "0.1.0"
 description = "Manifest-backed local Dag bundle for Apache Airflow: immutable, content-addressed Dag snapshots with reproducible pinned execution."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Ephraim Anierobi", email = "ephraim@astronomer.io" }]
+keywords = ["airflow", "dag", "bundle", "deployment", "content-addressed", "manifest"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: Apache Airflow",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    # The bundle uses fcntl file locks, so it is POSIX-only (like Airflow itself).
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     # Needs the Dag-bundle versioning APIs (BaseDagBundle.versions_dir, version pinning,
     # usage tracking), available since Airflow 3.1.
