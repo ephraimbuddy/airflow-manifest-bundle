@@ -120,14 +120,6 @@ class TestManifestLocalDagBundle:
         assert bundle.published_versions_dir == tmp_path / "published/versions/manifest-local"
         assert bundle.publication_lock_path == tmp_path / "published/_locks/manifest-local.lock"
 
-    def test_rejects_source_scanning_path(self, tmp_path):
-        with pytest.raises(TypeError, match="does not accept source-scanning config key 'path'"):
-            ManifestLocalDagBundle(
-                name="manifest-local",
-                path=str(tmp_path / "source"),
-                published_root=str(tmp_path / "published"),
-            )
-
     @pytest.mark.parametrize("published_root_position", ["inside", "ancestor"])
     def test_rejects_published_root_overlapping_airflow_cache(self, tmp_path, published_root_position):
         cache_root = tmp_path / "cache"

@@ -126,17 +126,12 @@ class ManifestLocalDagBundle(BaseDagBundle):
         published_root: str | None = None,
         **kwargs,
     ) -> None:
-        # TypeError, not ValueError: stock prepare_callback_bundle swallows ValueError from
-        # bundle construction as "Bundle no longer configured", silently dropping callbacks
-        # with a misleading log. TypeError matches how every other bundle class fails on a
-        # bad config kwarg (BaseDagBundle.__init__ has no **kwargs tolerance).
-        if "path" in kwargs:
-            raise TypeError(
-                "ManifestLocalDagBundle does not accept source-scanning config key 'path'. "
-                "Pass the source directory to `airflow-manifest-bundle publish-local` instead."
-            )
         super().__init__(**kwargs)
         if not published_root:
+            # TypeError, not ValueError: stock prepare_callback_bundle swallows ValueError
+            # from bundle construction as "Bundle no longer configured", silently dropping
+            # callbacks with a misleading log. TypeError matches how any bundle class fails
+            # on a bad config kwarg.
             raise TypeError("published_root must be provided")
         self.published_root = Path(published_root)
         self.manifest_ref_path = self.published_root / "refs" / self.name / "latest.json"
