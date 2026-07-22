@@ -28,7 +28,7 @@ from unittest import mock
 import pytest
 
 from airflow_manifest_bundle import bundle as local_bundle_module
-from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
+from airflow_manifest_bundle._compat import BundleVersion, remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
     BundleManifestReferenceChangedError,
     ManifestLocalDagBundle,
@@ -153,9 +153,14 @@ class TestManifestLocalDagBundle:
         bundle_version = bundle.get_current_version()
 
         assert _version_string(bundle_version) == published.version
-        # No version_data flows through Airflow: older releases have no such plumbing,
-        # and on newer ones the BundleVersion is returned with data=None.
-        assert getattr(bundle_version, "data", None) is None
+        if BundleVersion is not None:
+            # Airflow 3.3+ receives the manifest metadata and persists it on DagVersion rows.
+            assert bundle_version.data == published.version_data
+            assert "files" not in bundle_version.data
+            assert bundle_version.data["manifest"]["path"] == MANIFEST_FILE_NAME
+        else:
+            # Airflow 3.1/3.2 only understand plain string versions.
+            assert isinstance(bundle_version, str)
 
     def test_path_and_get_current_version_do_not_materialize_snapshots(self, tmp_path):
         missing_version = f"sha256-{'0' * 64}"

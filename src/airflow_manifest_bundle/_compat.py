@@ -32,21 +32,20 @@ from typing import Any
 
 try:
     from airflow.dag_processing.bundles.base import BundleVersion
-except ImportError:  # Airflow < 3.2: get_current_version returns a plain string
+except ImportError:  # Airflow 3.1/3.2: get_current_version returns a plain string
     BundleVersion = None  # type: ignore[assignment,misc]
 
 
-def make_bundle_version(version: str) -> Any:
+def make_bundle_version(version: str, data: dict[str, Any] | None = None) -> Any:
     """
     Return ``version`` in the richest form the installed Airflow understands.
 
-    Newer Airflow expects a ``BundleVersion`` (returning a bare string triggers a
-    legacy-return warning); older releases only know plain strings. The ``data``
-    field is always None — this bundle carries no version_data, so it stays
-    compatible with releases that have no version_data plumbing at all.
+    Airflow 3.3+ expects a ``BundleVersion`` (a bare string from a versioned bundle
+    triggers a deprecation warning) and persists its ``data`` on DagVersion rows;
+    3.1/3.2 only know plain strings, so ``data`` is dropped there.
     """
     if BundleVersion is not None:
-        return BundleVersion(version=version, data=None)
+        return BundleVersion(version=version, data=data)
     return version
 
 

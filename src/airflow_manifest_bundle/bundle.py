@@ -127,8 +127,8 @@ class ManifestLocalDagBundle(BaseDagBundle):
         version_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
-        # version_data is accepted so newer Airflow (which passes it when constructing
-        # pinned bundles) keeps working, but deliberately unused: pinned runs validate
+        # version_data is accepted so Airflow versions that pass it back when constructing
+        # pinned bundles keep working, but deliberately unused: pinned runs validate
         # against the snapshot's own self-certifying manifest (the version IS the content
         # hash of its entries), so the bundle also runs on releases without version_data.
         del version_data
@@ -158,12 +158,19 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self._current_manifest_ref: LocalBundleManifestRef | None = None
 
     def get_current_version(self) -> Any:
-        """Current version, as a ``BundleVersion`` on newer Airflow or a plain string on older."""
+        """
+        Current version: a ``BundleVersion`` on Airflow 3.3+, a plain string on 3.1/3.2.
+
+        On 3.3+ the manifest metadata (digest, file count, total size) rides along as
+        ``BundleVersion.data`` and is persisted on DagVersion rows. Pinned bundles return
+        just the version: the pinned snapshot is self-certifying, so no metadata lookup
+        is needed (or reliable — the release reference may have moved on).
+        """
         if self.version:
             return make_bundle_version(self.version)
         with _oserror_as_manifest_error():
             manifest_ref = self._ensure_current_manifest_ref()
-        return make_bundle_version(manifest_ref.version)
+        return make_bundle_version(manifest_ref.version, manifest_ref.version_data)
 
     def initialize(self) -> None:
         if self.version:
