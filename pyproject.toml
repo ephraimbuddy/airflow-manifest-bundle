@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "airflow-manifest-bundle"
+version = "0.1.0"
+description = "Manifest-backed local Dag bundle for Apache Airflow: immutable, content-addressed Dag snapshots with reproducible pinned execution."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Ephraim Anierobi", email = "ephraim@astronomer.io" }]
+dependencies = [
+    # Needs BundleVersion / version_data support in BaseDagBundle, which is on
+    # Airflow main and unreleased as of 2026-07 (3.1.x does not have it).
+    "apache-airflow>=3.2.0",
+]
+
+[project.scripts]
+airflow-manifest-bundle = "airflow_manifest_bundle.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/airflow_manifest_bundle"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
