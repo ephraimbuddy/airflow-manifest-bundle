@@ -91,7 +91,7 @@ class BundleSourceSnapshot:
 
 @dataclass(frozen=True)
 class BundleVersionManifest:
-    """Full manifest plus compact metadata suitable for DagVersion.version_data."""
+    """Full manifest plus the compact release-reference payload written to latest.json."""
 
     version: str
     manifest: dict[str, Any]
@@ -269,7 +269,12 @@ def build_version_data(
     file_count: int,
     total_size: int,
 ) -> dict[str, Any]:
-    """Build the compact version_data payload; the one place that defines its schema."""
+    """
+    Build the compact release-reference payload; the one place that defines its schema.
+
+    This is the package's own latest.json format, independent of any Airflow plumbing —
+    the name predates that distinction and is kept for API stability.
+    """
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "bundle_name": bundle_name,

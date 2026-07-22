@@ -11,9 +11,9 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "Ephraim Anierobi", email = "ephraim@astronomer.io" }]
 dependencies = [
-    # Needs BundleVersion / version_data support in BaseDagBundle, which is on
-    # Airflow main and unreleased as of 2026-07 (3.1.x does not have it).
-    "apache-airflow>=3.2.0",
+    # Needs the Dag-bundle versioning APIs (BaseDagBundle.versions_dir, version pinning,
+    # usage tracking), available since Airflow 3.1.
+    "apache-airflow>=3.1.0",
 ]
 
 [project.scripts]

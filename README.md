@@ -22,8 +22,9 @@ without requiring Git — it works like `GitDagBundle` does for commits:
 pip install .
 ```
 
-Requires Airflow with `BundleVersion` / `version_data` support in `BaseDagBundle`
-(Airflow main as of July 2026; not in 3.1.x).
+Requires Apache Airflow 3.1 or newer. On releases whose `get_current_version` contract
+is a plain string, the bundle returns the version string; on newer releases it returns
+a `BundleVersion` — detected at import time, no configuration needed.
 
 ## Configure
 

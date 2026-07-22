@@ -27,8 +27,6 @@ from unittest import mock
 
 import pytest
 
-from airflow.dag_processing.bundles.base import BundleVersion
-
 from airflow_manifest_bundle import bundle as local_bundle_module
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
@@ -53,6 +51,11 @@ def _write_file(root: Path, relative_path: str, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     return path
+
+
+def _version_string(result) -> str:
+    # get_current_version returns BundleVersion on newer Airflow, a plain str on older.
+    return getattr(result, "version", result)
 
 
 def _write_manifest_ref(manifest_ref_path: Path, version_data: dict) -> None:
@@ -149,11 +152,10 @@ class TestManifestLocalDagBundle:
             published = _publish_manifest_local_bundle(bundle, source)
         bundle_version = bundle.get_current_version()
 
-        assert isinstance(bundle_version, BundleVersion)
-        assert bundle_version.version == published.version
-        assert bundle_version.data == published.version_data
-        assert "files" not in bundle_version.data
-        assert bundle_version.data["manifest"]["path"] == MANIFEST_FILE_NAME
+        assert _version_string(bundle_version) == published.version
+        # No version_data flows through Airflow: older releases have no such plumbing,
+        # and on newer ones the BundleVersion is returned with data=None.
+        assert getattr(bundle_version, "data", None) is None
 
     def test_path_and_get_current_version_do_not_materialize_snapshots(self, tmp_path):
         missing_version = f"sha256-{'0' * 64}"
@@ -183,7 +185,7 @@ class TestManifestLocalDagBundle:
             with mock.patch.object(
                 ManifestLocalDagBundle, "_materialize_cached_version", autospec=True
             ) as mock_materialize:
-                assert bundle.get_current_version().version == missing_version
+                assert _version_string(bundle.get_current_version()) == missing_version
                 assert bundle.path == bundle.versions_dir / (missing_version)
             mock_materialize.assert_not_called()
 
@@ -496,7 +498,7 @@ class TestManifestLocalDagBundle:
             _write_file(source, "dags/new.py", "print('new')")
             fresh_bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(published_root))
 
-            assert fresh_bundle.get_current_version().version == published.version
+            assert _version_string(fresh_bundle.get_current_version()) == published.version
             fresh_bundle.refresh()
             assert fresh_bundle.path == fresh_bundle.versions_dir / (published.version)
             assert (fresh_bundle.path / "dags/example.py").read_text() == "print('dag')"
@@ -519,7 +521,7 @@ class TestManifestLocalDagBundle:
             bundle.refresh()
 
             assert second.version != first.version
-            assert bundle.get_current_version().version == second.version
+            assert _version_string(bundle.get_current_version()) == second.version
             assert (bundle.path / "dags/example.py").read_text() == "print('changed')"
 
     def test_ref_update_before_snapshot_materialization_raises_clear_error(self, tmp_path):
@@ -546,18 +548,18 @@ class TestManifestLocalDagBundle:
             published_root = tmp_path / "published"
             bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(published_root))
             published = _publish_manifest_local_bundle(bundle, source)
-            bundle_version = BundleVersion(version=published.version, data=published.version_data)
-
+            # version_data is accepted (newer Airflow passes it when constructing pinned
+            # bundles) but ignored; validation uses the snapshot's own manifest.
             pinned_bundle = ManifestLocalDagBundle(
                 name="manifest-local",
                 published_root=str(published_root),
-                version=bundle_version.version,
-                version_data=bundle_version.data,
+                version=published.version,
+                version_data=published.version_data,
             )
             pinned_bundle.initialize()
 
-            assert pinned_bundle.get_current_version() == bundle_version
-            assert pinned_bundle.path == bundle.versions_dir / (bundle_version.version)
+            assert _version_string(pinned_bundle.get_current_version()) == published.version
+            assert pinned_bundle.path == bundle.versions_dir / (published.version)
             assert (pinned_bundle.path / "dags/example.py").read_text() == "print('dag')"
 
     def test_pinned_bundle_without_version_data_validates_snapshot_manifest(self, tmp_path):
@@ -577,7 +579,7 @@ class TestManifestLocalDagBundle:
             pinned_bundle.initialize()
 
             assert pinned_bundle.path == bundle.versions_dir / (published.version)
-            assert pinned_bundle.get_current_version() == BundleVersion(version=published.version, data=None)
+            assert _version_string(pinned_bundle.get_current_version()) == published.version
 
     def test_pinned_bundle_rematerializes_deleted_cache(self, tmp_path):
         source = tmp_path / "source"
@@ -1252,7 +1254,6 @@ class TestReviewRegressions:
                 name="manifest-local",
                 published_root=str(tmp_path / "published"),
                 version=published.version,
-                version_data=published.version_data,
             )
             storage_root = tmp_path / "bundles"
             storage_root.chmod(0o000)

@@ -32,12 +32,11 @@ from typing import Any, ClassVar
 
 from airflow.dag_processing.bundles.base import (
     BaseDagBundle,
-    BundleVersion,
     get_bundle_storage_root_path,
     get_bundle_tracking_file,
 )
 
-from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
+from airflow_manifest_bundle._compat import make_bundle_version, remove_bundle_tree_forcefully
 from airflow_manifest_bundle.manifest import (
     MANIFEST_FILE_NAME,
     MANIFEST_SCHEMA_VERSION,
@@ -125,8 +124,14 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self,
         *,
         published_root: str | None = None,
+        version_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
+        # version_data is accepted so newer Airflow (which passes it when constructing
+        # pinned bundles) keeps working, but deliberately unused: pinned runs validate
+        # against the snapshot's own self-certifying manifest (the version IS the content
+        # hash of its entries), so the bundle also runs on releases without version_data.
+        del version_data
         # TypeError, not ValueError: stock prepare_callback_bundle swallows ValueError from
         # bundle construction as "Bundle no longer configured", silently dropping callbacks
         # with a misleading log. TypeError matches how every other bundle class fails on a
@@ -152,26 +157,21 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self.publication_lock_path = self.published_root / "_locks" / f"{self.name}.lock"
         self._current_manifest_ref: LocalBundleManifestRef | None = None
 
-    def get_current_version(self) -> BundleVersion:
+    def get_current_version(self) -> Any:
+        """Current version, as a ``BundleVersion`` on newer Airflow or a plain string on older."""
         if self.version:
-            return BundleVersion(version=self.version, data=self.version_data)
+            return make_bundle_version(self.version)
         with _oserror_as_manifest_error():
             manifest_ref = self._ensure_current_manifest_ref()
-        return BundleVersion(version=manifest_ref.version, data=manifest_ref.version_data)
+        return make_bundle_version(manifest_ref.version)
 
     def initialize(self) -> None:
         if self.version:
             version = _validate_local_manifest_version(self.version, source="pinned bundle version")
-            manifest_ref = self._manifest_ref_from_version_data()
-            if manifest_ref and manifest_ref.version != version:
-                raise BundleManifestError(
-                    f"Local bundle version_data contains version {manifest_ref.version!r}, "
-                    f"expected {version!r}"
-                )
             with _oserror_as_manifest_error():
-                if not self._has_validated_cache(version, manifest_ref=manifest_ref):
+                if not self._has_validated_cache(version, manifest_ref=None):
                     with self.lock():
-                        self._materialize_cached_version(version=version, manifest_ref=manifest_ref)
+                        self._materialize_cached_version(version=version, manifest_ref=None)
         else:
             self.refresh()
         super().initialize()
@@ -380,7 +380,8 @@ class ManifestLocalDagBundle(BaseDagBundle):
         if manifest_ref:
             if manifest_ref.version != version:
                 raise BundleManifestError(
-                    f"Local bundle version_data contains version {manifest_ref.version!r}, expected {version!r}"
+                    f"Local bundle manifest reference contains version {manifest_ref.version!r}, "
+                    f"expected {version!r}"
                 )
             self._validate_snapshot_for_ref(manifest_ref, version_path, check_content=check_content)
             return
@@ -406,11 +407,6 @@ class ManifestLocalDagBundle(BaseDagBundle):
             invalid_message=f"Local bundle manifest reference is not valid JSON: {self.manifest_ref_path}",
         )
         return self._manifest_ref_from_payload(payload, source=str(self.manifest_ref_path))
-
-    def _manifest_ref_from_version_data(self) -> LocalBundleManifestRef | None:
-        if not self.version_data:
-            return None
-        return self._manifest_ref_from_payload(self.version_data, source="version_data")
 
     def _manifest_ref_from_payload(self, payload: dict[str, Any], source: str) -> LocalBundleManifestRef:
         schema_version = payload.get("schema_version")

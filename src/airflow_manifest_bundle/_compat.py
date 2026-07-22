@@ -28,6 +28,26 @@ import os
 import shutil
 import stat
 from pathlib import Path
+from typing import Any
+
+try:
+    from airflow.dag_processing.bundles.base import BundleVersion
+except ImportError:  # Airflow < 3.2: get_current_version returns a plain string
+    BundleVersion = None  # type: ignore[assignment,misc]
+
+
+def make_bundle_version(version: str) -> Any:
+    """
+    Return ``version`` in the richest form the installed Airflow understands.
+
+    Newer Airflow expects a ``BundleVersion`` (returning a bare string triggers a
+    legacy-return warning); older releases only know plain strings. The ``data``
+    field is always None — this bundle carries no version_data, so it stays
+    compatible with releases that have no version_data plumbing at all.
+    """
+    if BundleVersion is not None:
+        return BundleVersion(version=version, data=None)
+    return version
 
 
 def _make_tree_writable(path: Path) -> None:
