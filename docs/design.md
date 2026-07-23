@@ -224,8 +224,8 @@ compatible must use a new schema version.
 
 The package is one family: manifest bundles. Each storage backend is one module.
 
-- A new backend adds one module (for example, `s3.py` with `ManifestS3DagBundle`),
-  one CLI subcommand (for example, `publish-s3`), and one optional-dependency group
+- A new backend adds one module (for example, `gcs.py` with `ManifestGCSDagBundle`),
+  one CLI subcommand (for example, `publish-gcs`), and one optional-dependency group
   in `pyproject.toml`.
 - All backends share `manifest.py`. The version calculation stays the same for all
   backends.
