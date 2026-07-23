@@ -27,11 +27,15 @@ changing runtime behavior — it defines the terms and the safety argument.
 ## Commands
 
 ```bash
-uv venv && uv pip install "apache-airflow==3.3.0" pytest .   # or 3.1.8
+uv venv && uv pip install "apache-airflow==3.3.0" pytest -e .   # or 3.1.8
 .venv/bin/python -m pytest -q            # full suite, ~3s
 uvx ruff check src tests                 # lint
 uv build && uvx twine check dist/*       # packaging sanity
 ```
+
+Install with `-e` (editable): the tests import the installed package, not `src/`, so a
+non-editable install silently tests stale code after you edit `src/`. CI installs
+non-editable on purpose — it validates the packaged wheel — so do not "fix" that.
 
 ## Invariants — do not break these
 
@@ -43,6 +47,8 @@ uv build && uvx twine check dist/*       # packaging sanity
    builds cache, lock, and tracking paths from the raw version string.
 3. **Error contract.** Every entry point Airflow calls (`initialize`, `refresh`,
    `get_current_version`, `path`) must only raise `AirflowException` subclasses.
+   (One deliberate exception: `refresh()` raises `ValueError` on a pinned bundle —
+   Airflow core never does that, and the guard marks a programming error. Keep it.)
    Manifest errors use `BundleManifestError`; missing artifacts use
    `BundleManifestNotFoundError` (also a `FileNotFoundError` — keep the dual
    inheritance); incidental `OSError` is wrapped via `_oserror_as_manifest_error`.
