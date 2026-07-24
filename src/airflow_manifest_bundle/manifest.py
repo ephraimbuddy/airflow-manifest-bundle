@@ -208,13 +208,14 @@ def _validate_bundle_root(root: Path) -> Path:
 def collect_bundle_source_snapshot(root: Path) -> BundleSourceSnapshot:
     """Collect deterministic source-file metadata without reading file contents."""
     root = _validate_bundle_root(root)
-    files = tuple(_build_source_file(root, path) for path in _iter_manifest_file_paths(root))
+    files = [_build_source_file(root, path) for path in _iter_manifest_file_paths(root)]
+    files.sort(key=lambda source_file: source_file.relative_path)
     signature_payload = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "files": [file.build_signature_record() for file in files],
     }
     signature = f"sha256:{hashlib.sha256(_serialize_manifest_payload(signature_payload)).hexdigest()}"
-    return BundleSourceSnapshot(root=root, files=files, signature=signature)
+    return BundleSourceSnapshot(root=root, files=tuple(files), signature=signature)
 
 
 def _ensure_source_file_unchanged(source_file: BundleSourceFile) -> None:

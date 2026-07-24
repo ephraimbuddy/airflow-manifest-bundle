@@ -161,12 +161,13 @@ def test_manifest_ignores_git_worktree_pointer_file(tmp_path):
 def test_manifest_paths_are_relative_and_sorted(tmp_path):
     source = tmp_path / "source"
     _write_file(source, "z.py", "print('z')")
+    _write_file(source, "a/nested.py", "print('nested')")
     _write_file(source, "a.py", "print('a')")
 
     manifest = build_bundle_version_manifest(bundle_name="manifest-local", root=source, backend_type="local")
     paths = [file_info["path"] for file_info in manifest["files"]]
 
-    assert paths == ["a.py", "z.py"]
+    assert paths == ["a.py", "a/nested.py", "z.py"]
     assert str(source) not in json.dumps(manifest)
 
 

@@ -205,6 +205,30 @@ class TestManifestLocalDagBundle:
             assert snapshot_manifest["version"] == published.version
             assert [file_info["path"] for file_info in snapshot_manifest["files"]] == ["dags/example.py"]
 
+    def test_publish_and_refresh_support_nested_paths_before_root_files(self, tmp_path):
+        source = tmp_path / "source"
+        _write_file(source, "z.py", "print('root')")
+        _write_file(source, "a/example.py", "print('nested')")
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+
+            published = publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+            snapshot_manifest = json.loads(
+                (published.version_path / MANIFEST_FILE_NAME).read_text(encoding="utf-8")
+            )
+            bundle.refresh()
+
+            assert [file_info["path"] for file_info in snapshot_manifest["files"]] == [
+                "a/example.py",
+                "z.py",
+            ]
+            assert (bundle.path / "a/example.py").read_text() == "print('nested')"
+            assert (bundle.path / "z.py").read_text() == "print('root')"
+
     def test_publish_manifest_local_dag_bundle_is_idempotent(self, tmp_path):
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")
