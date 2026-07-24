@@ -834,6 +834,23 @@ class TestManifestLocalDagBundle:
         with pytest.raises(BundleManifestError, match="not valid JSON"):
             bundle.refresh()
 
+    def test_json_reader_uses_utf8_encoding(self, tmp_path, monkeypatch):
+        path = tmp_path / "payload.json"
+        path.write_bytes('{"value": "valid UTF-8: ☃"}'.encode())
+        real_read_text = Path.read_text
+
+        def require_utf8(path, encoding=None, errors=None):
+            assert encoding == "utf-8"
+            return real_read_text(path, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", require_utf8)
+
+        assert ManifestLocalDagBundle._read_json_file(
+            path,
+            missing_message="missing",
+            invalid_message="invalid",
+        ) == {"value": "valid UTF-8: \u2603"}
+
     @pytest.mark.parametrize("entry_point", ["path", "get_current_version", "refresh", "initialize"])
     def test_entry_points_reject_non_utf8_manifest_ref(self, tmp_path, entry_point):
         bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(tmp_path / "published"))
