@@ -373,11 +373,28 @@ class TestManifestLocalDagBundle:
                 published_root=str(tmp_path / "published"),
             )
 
-            with pytest.raises(ValueError, match="versions_dir must not be inside source_path"):
+            with pytest.raises(ValueError, match="source_path and versions_dir must not overlap"):
                 publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
 
             assert not bundle.manifest_ref_path.exists()
             assert not storage_path.exists()
+
+    def test_publish_manifest_local_dag_bundle_rejects_source_inside_versions_dir(self, tmp_path):
+        storage_path = tmp_path / "bundles"
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(storage_path)}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            source = bundle.versions_dir / "publisher-source"
+            dag_file = _write_file(source, "dags/example.py", "print('dag')")
+
+            with pytest.raises(ValueError, match="source_path and versions_dir must not overlap"):
+                publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+
+            assert dag_file.exists()
+            assert not bundle.manifest_ref_path.exists()
 
     def test_publish_manifest_local_dag_bundle_fsyncs_versions_dir_before_ref_write(
         self, tmp_path, monkeypatch
@@ -638,6 +655,62 @@ class TestManifestLocalDagBundle:
                 fresh_bundle.initialize()
             assert (fresh_bundle.path / "dags/example.py").read_text() == "print('dag')"
 
+    def test_cache_tree_and_marker_are_fsynced_in_durability_order(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        _write_file(source, "dags/example.py", "print('dag')")
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            published = _publish_manifest_local_bundle(bundle, source)
+            cached_version_path = bundle.versions_dir / published.version
+            marker_path = bundle._validation_marker_path(published.version)
+            calls: list[tuple[str, Path]] = []
+            real_fsync_file = local_bundle_module._fsync_file
+            real_fsync_directory = local_bundle_module._fsync_directory
+            real_replace = local_bundle_module.os.replace
+
+            def record_fsync_file(path):
+                calls.append(("fsync_file", Path(path)))
+                real_fsync_file(path)
+
+            def record_fsync_directory(path):
+                calls.append(("fsync_directory", Path(path)))
+                real_fsync_directory(path)
+
+            def record_replace(source_path, destination_path):
+                destination_path = Path(destination_path)
+                if destination_path == cached_version_path:
+                    calls.append(("replace_cache", destination_path))
+                real_replace(source_path, destination_path)
+
+            monkeypatch.setattr(local_bundle_module, "_fsync_file", record_fsync_file)
+            monkeypatch.setattr(local_bundle_module, "_fsync_directory", record_fsync_directory)
+            monkeypatch.setattr(local_bundle_module.os, "replace", record_replace)
+
+            bundle.refresh()
+
+            replace_index = calls.index(("replace_cache", cached_version_path))
+            marker_fsync_index = calls.index(("fsync_file", marker_path))
+            cache_file_fsync_indices = [
+                index
+                for index, (operation, path) in enumerate(calls)
+                if operation == "fsync_file" and path != marker_path
+            ]
+            versions_dir_fsync_indices = [
+                index
+                for index, call in enumerate(calls)
+                if call == ("fsync_directory", bundle.versions_dir)
+            ]
+
+            assert cache_file_fsync_indices
+            assert max(cache_file_fsync_indices) < replace_index
+            assert any(replace_index < index < marker_fsync_index for index in versions_dir_fsync_indices)
+            assert any(index > marker_fsync_index for index in versions_dir_fsync_indices)
+            assert marker_path.read_text() == published.version
+
     def test_refresh_survives_undeletable_orphan_temp_snapshot(self, tmp_path):
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")
@@ -760,6 +833,37 @@ class TestManifestLocalDagBundle:
 
         with pytest.raises(BundleManifestError, match="not valid JSON"):
             bundle.refresh()
+
+    def test_json_reader_uses_utf8_encoding(self, tmp_path, monkeypatch):
+        path = tmp_path / "payload.json"
+        path.write_bytes('{"value": "valid UTF-8: ☃"}'.encode())
+        real_read_text = Path.read_text
+
+        def require_utf8(path, encoding=None, errors=None):
+            assert encoding == "utf-8"
+            return real_read_text(path, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", require_utf8)
+
+        assert ManifestLocalDagBundle._read_json_file(
+            path,
+            missing_message="missing",
+            invalid_message="invalid",
+        ) == {"value": "valid UTF-8: \u2603"}
+
+    @pytest.mark.parametrize("entry_point", ["path", "get_current_version", "refresh", "initialize"])
+    def test_entry_points_reject_non_utf8_manifest_ref(self, tmp_path, entry_point):
+        bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(tmp_path / "published"))
+        bundle.manifest_ref_path.parent.mkdir(parents=True)
+        bundle.manifest_ref_path.write_bytes(b"\xff")
+
+        with pytest.raises(BundleManifestError, match="not valid JSON") as excinfo:
+            if entry_point == "path":
+                _ = bundle.path
+            else:
+                getattr(bundle, entry_point)()
+
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
 
     @pytest.mark.parametrize(
         ("mutate", "match"),
@@ -1129,6 +1233,43 @@ class TestReviewRegressions:
 
             fresh.refresh()
             assert fresh.path == fresh.versions_dir / second.version
+
+    def test_path_rejects_truncated_current_cache(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _, published = self._published_bundle(tmp_path)
+            bundle.refresh()
+            (bundle.versions_dir / published.version / "dags/example.py").unlink()
+
+            ManifestLocalDagBundle._validated_version_paths.clear()
+            fresh = ManifestLocalDagBundle(
+                name="manifest-local", published_root=str(tmp_path / "published")
+            )
+
+            with pytest.raises(BundleManifestError, match="structurally invalid cache copy"):
+                _ = fresh.path
+
+    def test_path_fallback_skips_structurally_invalid_newest_cache(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source, first = self._published_bundle(tmp_path)
+            bundle.refresh()
+
+            _write_file(source, "dags/example.py", "print('dag v2')")
+            second = _publish_manifest_local_bundle(bundle, source)
+            bundle.refresh()
+            (bundle.versions_dir / second.version / "dags/example.py").unlink()
+
+            os.utime(bundle._validation_marker_path(first.version), (1, 1))
+            os.utime(bundle._validation_marker_path(second.version), (2, 2))
+            ManifestLocalDagBundle._validated_version_paths.clear()
+
+            _write_file(source, "dags/example.py", "print('dag v3')")
+            third = _publish_manifest_local_bundle(bundle, source)
+            fresh = ManifestLocalDagBundle(
+                name="manifest-local", published_root=str(tmp_path / "published")
+            )
+
+            assert fresh.path == fresh.versions_dir / first.version
+            assert not (fresh.versions_dir / third.version).exists()
 
     def test_move_aside_removes_stock_tracking_file(self, tmp_path):
         # A tracking file pointing at a version dir the package removed would crash stock
