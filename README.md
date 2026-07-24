@@ -32,7 +32,6 @@ Bundles are discovered purely via Airflow config — no plugin registration:
 
 ```ini
 [dag_processor]
-dag_bundle_storage_path = /var/lib/airflow/dag-bundle-cache
 dag_bundle_config_list = [
     {
       "name": "my_dags",
@@ -42,8 +41,20 @@ dag_bundle_config_list = [
   ]
 ```
 
-or the environment-variable equivalents (`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST`,
-`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`).
+`dag_bundle_storage_path` is optional. If you do not set it, Airflow uses
+`Path(tempfile.gettempdir()) / "airflow" / "dag_bundles"` (usually
+`/tmp/airflow/dag_bundles`) for its disposable cache. Set it explicitly when you
+want a predictable location where you can inspect materialized snapshots and their
+embedded manifests:
+
+```ini
+[dag_processor]
+dag_bundle_storage_path = /var/lib/airflow/dag-bundle-cache
+```
+
+The environment-variable equivalents are
+`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST` and, for the optional cache-path
+override, `AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`.
 
 Keep three locations separate and non-overlapping:
 
