@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from _test_utils import conf_vars
 
 from airflow_manifest_bundle import local as local_bundle_module
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
@@ -24,8 +25,6 @@ from airflow_manifest_bundle.manifest import (
     build_bundle_version_manifest_result,
     serialize_bundle_version_manifest,
 )
-
-from _test_utils import conf_vars
 
 
 def _write_file(root: Path, relative_path: str, content: str) -> Path:
@@ -107,12 +106,14 @@ class TestManifestLocalDagBundle:
         cache_root = tmp_path / "cache"
         published_root = cache_root / "published" if published_root_position == "inside" else tmp_path
 
-        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(cache_root)}):
-            with pytest.raises(ValueError, match="must not overlap Airflow's bundle cache"):
-                ManifestLocalDagBundle(
-                    name="manifest-local",
-                    published_root=str(published_root),
-                )
+        with (
+            conf_vars({("dag_processor", "dag_bundle_storage_path"): str(cache_root)}),
+            pytest.raises(ValueError, match="must not overlap Airflow's bundle cache"),
+        ):
+            ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(published_root),
+            )
 
     def test_get_current_version_returns_bundle_version_from_ref(self, tmp_path):
         source = tmp_path / "source"
@@ -1195,7 +1196,7 @@ class TestReviewRegressions:
                 name="manifest-local", published_root=str(tmp_path / "published")
             )
             with pytest.raises(BundleManifestError, match="manifest reference file") as excinfo:
-                bundle.path
+                _ = bundle.path
             assert isinstance(excinfo.value, AirflowException)
 
     def test_path_falls_back_to_newest_cached_version_before_materialization(self, tmp_path):

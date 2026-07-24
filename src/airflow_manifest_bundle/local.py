@@ -20,7 +20,10 @@ from airflow.dag_processing.bundles.base import (
     get_bundle_tracking_file,
 )
 
-from airflow_manifest_bundle._compat import make_bundle_version, remove_bundle_tree_forcefully
+from airflow_manifest_bundle._compat import (
+    make_bundle_version,
+    remove_bundle_tree_forcefully,
+)
 from airflow_manifest_bundle.manifest import (
     MANIFEST_FILE_NAME,
     MANIFEST_SCHEMA_VERSION,
