@@ -216,10 +216,13 @@ class ManifestLocalDagBundle(BaseDagBundle):
         return True
 
     def _record_validated_cache(self, version: str, cache_key: tuple[str, str, str]) -> None:
+        """Persist a marker after the cache tree and its parent entry are durable."""
         marker_path = self._validation_marker_path(version)
         marker_path.write_text(version)
         with suppress(OSError):
             marker_path.chmod(0o644)
+        _fsync_file(marker_path)
+        _fsync_directory(marker_path.parent)
         self._validated_version_paths.add(cache_key)
 
     @contextmanager
@@ -278,6 +281,8 @@ class ManifestLocalDagBundle(BaseDagBundle):
                 )
                 self._move_cached_version_aside(cached_version_path, version=version)
             else:
+                _fsync_tree(cached_version_path)
+                _fsync_directory(self.versions_dir)
                 self._record_validated_cache(version, cache_key)
                 return
 
@@ -312,7 +317,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
                 manifest_ref=manifest_ref,
             )
             _set_cache_tree_permissions(tmp_path)
-            _fsync_tree_directories(tmp_path)
+            _fsync_tree(tmp_path)
             os.replace(tmp_path, cached_version_path)
             _fsync_directory(self.versions_dir)
         except Exception:
@@ -1099,6 +1104,17 @@ def _fsync_tree_directories(root: Path) -> None:
     directories = [Path(dirpath) for dirpath, _, _ in os.walk(root)]
     for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
         _fsync_directory(directory)
+
+
+def _fsync_tree(root: Path) -> None:
+    """Make all regular files and directory entries in a tree durable."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if not path.is_symlink():
+                _fsync_file(path)
+    _fsync_tree_directories(root)
 
 
 def _write_manifest_file(manifest: dict[str, Any], manifest_file: Path) -> None:

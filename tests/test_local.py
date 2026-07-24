@@ -637,6 +637,62 @@ class TestManifestLocalDagBundle:
                 fresh_bundle.initialize()
             assert (fresh_bundle.path / "dags/example.py").read_text() == "print('dag')"
 
+    def test_cache_tree_and_marker_are_fsynced_in_durability_order(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        _write_file(source, "dags/example.py", "print('dag')")
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            published = _publish_manifest_local_bundle(bundle, source)
+            cached_version_path = bundle.versions_dir / published.version
+            marker_path = bundle._validation_marker_path(published.version)
+            calls: list[tuple[str, Path]] = []
+            real_fsync_file = local_bundle_module._fsync_file
+            real_fsync_directory = local_bundle_module._fsync_directory
+            real_replace = local_bundle_module.os.replace
+
+            def record_fsync_file(path):
+                calls.append(("fsync_file", Path(path)))
+                real_fsync_file(path)
+
+            def record_fsync_directory(path):
+                calls.append(("fsync_directory", Path(path)))
+                real_fsync_directory(path)
+
+            def record_replace(source_path, destination_path):
+                destination_path = Path(destination_path)
+                if destination_path == cached_version_path:
+                    calls.append(("replace_cache", destination_path))
+                real_replace(source_path, destination_path)
+
+            monkeypatch.setattr(local_bundle_module, "_fsync_file", record_fsync_file)
+            monkeypatch.setattr(local_bundle_module, "_fsync_directory", record_fsync_directory)
+            monkeypatch.setattr(local_bundle_module.os, "replace", record_replace)
+
+            bundle.refresh()
+
+            replace_index = calls.index(("replace_cache", cached_version_path))
+            marker_fsync_index = calls.index(("fsync_file", marker_path))
+            cache_file_fsync_indices = [
+                index
+                for index, (operation, path) in enumerate(calls)
+                if operation == "fsync_file" and path != marker_path
+            ]
+            versions_dir_fsync_indices = [
+                index
+                for index, call in enumerate(calls)
+                if call == ("fsync_directory", bundle.versions_dir)
+            ]
+
+            assert cache_file_fsync_indices
+            assert max(cache_file_fsync_indices) < replace_index
+            assert any(replace_index < index < marker_fsync_index for index in versions_dir_fsync_indices)
+            assert any(index > marker_fsync_index for index in versions_dir_fsync_indices)
+            assert marker_path.read_text() == published.version
+
     def test_refresh_survives_undeletable_orphan_temp_snapshot(self, tmp_path):
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")
