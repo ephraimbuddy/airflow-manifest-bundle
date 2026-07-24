@@ -721,7 +721,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
             payload = json.loads(path.read_text())
         except FileNotFoundError as e:
             raise BundleManifestNotFoundError(missing_message) from e
-        except json.JSONDecodeError as e:
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
             raise BundleManifestError(invalid_message) from e
 
         if not isinstance(payload, dict):

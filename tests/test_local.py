@@ -760,6 +760,20 @@ class TestManifestLocalDagBundle:
         with pytest.raises(BundleManifestError, match="not valid JSON"):
             bundle.refresh()
 
+    @pytest.mark.parametrize("entry_point", ["path", "get_current_version", "refresh", "initialize"])
+    def test_entry_points_reject_non_utf8_manifest_ref(self, tmp_path, entry_point):
+        bundle = ManifestLocalDagBundle(name="manifest-local", published_root=str(tmp_path / "published"))
+        bundle.manifest_ref_path.parent.mkdir(parents=True)
+        bundle.manifest_ref_path.write_bytes(b"\xff")
+
+        with pytest.raises(BundleManifestError, match="not valid JSON") as excinfo:
+            if entry_point == "path":
+                _ = bundle.path
+            else:
+                getattr(bundle, entry_point)()
+
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
     @pytest.mark.parametrize(
         ("mutate", "match"),
         [
