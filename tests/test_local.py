@@ -372,11 +372,28 @@ class TestManifestLocalDagBundle:
                 published_root=str(tmp_path / "published"),
             )
 
-            with pytest.raises(ValueError, match="versions_dir must not be inside source_path"):
+            with pytest.raises(ValueError, match="source_path and versions_dir must not overlap"):
                 publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
 
             assert not bundle.manifest_ref_path.exists()
             assert not storage_path.exists()
+
+    def test_publish_manifest_local_dag_bundle_rejects_source_inside_versions_dir(self, tmp_path):
+        storage_path = tmp_path / "bundles"
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(storage_path)}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            source = bundle.versions_dir / "publisher-source"
+            dag_file = _write_file(source, "dags/example.py", "print('dag')")
+
+            with pytest.raises(ValueError, match="source_path and versions_dir must not overlap"):
+                publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+
+            assert dag_file.exists()
+            assert not bundle.manifest_ref_path.exists()
 
     def test_publish_manifest_local_dag_bundle_fsyncs_versions_dir_before_ref_write(
         self, tmp_path, monkeypatch

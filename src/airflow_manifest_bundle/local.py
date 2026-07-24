@@ -1064,10 +1064,10 @@ def _validate_local_publish_paths(
             "outside the published snapshots before publishing a manifest local bundle."
         )
 
-    if _is_same_or_nested_path(versions_dir, source_path):
+    if _paths_overlap(source_path, versions_dir):
         raise ValueError(
-            "versions_dir must not be inside source_path. Keep Airflow's bundle cache outside the "
-            "Dag source tree before publishing a manifest local bundle."
+            "source_path and versions_dir must not overlap. Keep Airflow's bundle cache outside "
+            "the Dag source tree before publishing a manifest local bundle."
         )
 
 
