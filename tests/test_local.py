@@ -1143,6 +1143,43 @@ class TestReviewRegressions:
             fresh.refresh()
             assert fresh.path == fresh.versions_dir / second.version
 
+    def test_path_rejects_truncated_current_cache(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _, published = self._published_bundle(tmp_path)
+            bundle.refresh()
+            (bundle.versions_dir / published.version / "dags/example.py").unlink()
+
+            ManifestLocalDagBundle._validated_version_paths.clear()
+            fresh = ManifestLocalDagBundle(
+                name="manifest-local", published_root=str(tmp_path / "published")
+            )
+
+            with pytest.raises(BundleManifestError, match="structurally invalid cache copy"):
+                _ = fresh.path
+
+    def test_path_fallback_skips_structurally_invalid_newest_cache(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source, first = self._published_bundle(tmp_path)
+            bundle.refresh()
+
+            _write_file(source, "dags/example.py", "print('dag v2')")
+            second = _publish_manifest_local_bundle(bundle, source)
+            bundle.refresh()
+            (bundle.versions_dir / second.version / "dags/example.py").unlink()
+
+            os.utime(bundle._validation_marker_path(first.version), (1, 1))
+            os.utime(bundle._validation_marker_path(second.version), (2, 2))
+            ManifestLocalDagBundle._validated_version_paths.clear()
+
+            _write_file(source, "dags/example.py", "print('dag v3')")
+            third = _publish_manifest_local_bundle(bundle, source)
+            fresh = ManifestLocalDagBundle(
+                name="manifest-local", published_root=str(tmp_path / "published")
+            )
+
+            assert fresh.path == fresh.versions_dir / first.version
+            assert not (fresh.versions_dir / third.version).exists()
+
     def test_move_aside_removes_stock_tracking_file(self, tmp_path):
         # A tracking file pointing at a version dir the package removed would crash stock
         # stale cleanup (plain rmtree, only BlockingIOError caught) on every future sweep.

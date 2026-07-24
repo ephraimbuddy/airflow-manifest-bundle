@@ -206,7 +206,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
         except (BundleManifestError, OSError):
             log.warning(
                 "Cached snapshot has a validation marker but failed the structural check; "
-                "it will be rebuilt. bundle=%s version=%s",
+                "it must be rebuilt. bundle=%s version=%s",
                 self.name,
                 version,
                 exc_info=True,
@@ -370,8 +370,9 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self._validate_snapshot_files(snapshot_manifest, version_path, check_content=check_content)
 
     def _ensure_current_manifest_ref(self) -> LocalBundleManifestRef:
-        # Only a cheap read of the release reference: ``path`` and ``get_current_version``
-        # must not materialize or validate snapshots. That happens in initialize()/refresh().
+        # Only a cheap read of the release reference. Snapshot materialization and full
+        # checksum validation happen in initialize()/refresh(); ``path`` can still do the
+        # required structural check of a cache copy that has a validation marker.
         if self._current_manifest_ref is None:
             self._current_manifest_ref = self._read_current_manifest_ref()
         return self._current_manifest_ref
@@ -743,47 +744,54 @@ class ManifestLocalDagBundle(BaseDagBundle):
             version = _validate_local_manifest_version(self.version, source="pinned bundle version")
             return self.versions_dir / version
         with _oserror_as_manifest_error():
-            version = self._ensure_current_manifest_ref().version
-        current_version_path = self.versions_dir / version
-        if current_version_path.exists():
-            return current_version_path
-        # Stock core reads `path` on bundles it never initializes (callbacks without a
-        # bundle_version, priority parse requests before the first refresh tick). A just-
-        # published version is not materialized yet at that point — and callback rows are
-        # already deleted from the DB, so a nonexistent path loses the callback outright.
-        # Serving the newest validated cached version is strictly better than that.
-        fallback = self._latest_validated_cached_version_path()
-        if fallback is not None:
-            log.warning(
-                "Bundle version is not materialized yet; falling back to the newest cached "
-                "version. bundle=%s version=%s fallback=%s",
-                self.name,
-                version,
-                fallback.name,
-            )
-            return fallback
-        return current_version_path
+            manifest_ref = self._ensure_current_manifest_ref()
+            version = manifest_ref.version
+            current_version_path = self.versions_dir / version
+            if self._has_validated_cache(version, manifest_ref=manifest_ref):
+                return current_version_path
 
-    def _latest_validated_cached_version_path(self) -> Path | None:
-        """Newest cached version dir (by validation-marker mtime) that still exists on disk."""
-        best: Path | None = None
-        best_mtime = float("-inf")
+            # Stock core reads `path` on bundles it never initializes (callbacks without a
+            # bundle_version, priority parse requests before the first refresh tick). A just-
+            # published version is not materialized yet at that point — and callback rows are
+            # already deleted from the DB, so a nonexistent path loses the callback outright.
+            # Serving the newest validated cached version is strictly better than that.
+            fallback = self._latest_validated_cached_version_path(exclude_version=version)
+            if fallback is not None:
+                log.warning(
+                    "Bundle version is not materialized yet; falling back to the newest cached "
+                    "version. bundle=%s version=%s fallback=%s",
+                    self.name,
+                    version,
+                    fallback.name,
+                )
+                return fallback
+
+            if current_version_path.exists():
+                raise BundleManifestError(
+                    f"Bundle '{self.name}' version '{version}' has an unvalidated or structurally "
+                    f"invalid cache copy at {current_version_path}. Initialize or refresh the bundle "
+                    "to rebuild it before use."
+                )
+            return current_version_path
+
+    def _latest_validated_cached_version_path(self, *, exclude_version: str) -> Path | None:
+        """Newest marked cache version that passes this process's structural check."""
+        candidates: list[tuple[float, str]] = []
         try:
             entries = list(self.versions_dir.iterdir())
         except OSError:
             return None
         for entry in entries:
             version = _marker_file_version(entry)
-            if version is None:
-                continue
-            version_path = self.versions_dir / version
-            if not version_path.is_dir():
+            if version is None or version == exclude_version:
                 continue
             with suppress(OSError):
-                mtime = entry.stat().st_mtime
-                if mtime > best_mtime:
-                    best, best_mtime = version_path, mtime
-        return best
+                candidates.append((entry.stat().st_mtime, version))
+
+        for _, version in sorted(candidates, reverse=True):
+            if self._has_validated_cache(version, manifest_ref=None):
+                return self.versions_dir / version
+        return None
 
     def _remove_orphaned_validation_markers(self) -> None:
         """
