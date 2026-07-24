@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 
 import pytest
+from _test_utils import conf_vars
 
 from airflow_manifest_bundle import cli
 from airflow_manifest_bundle.manifest import MANIFEST_FILE_NAME
-
-from _test_utils import conf_vars
 
 
 def test_publish_local_command(tmp_path, capsys):
@@ -90,9 +89,8 @@ def test_publish_local_command_rejects_non_manifest_bundle(tmp_path):
             ("core", "load_examples"): "False",
             ("dag_processor", "dag_bundle_config_list"): json.dumps(config),
         }
-    ):
-        with pytest.raises(SystemExit, match="not configured as a ManifestLocalDagBundle"):
-            cli.main(["publish-local", "local", str(source)])
+    ), pytest.raises(SystemExit, match="not configured as a ManifestLocalDagBundle"):
+        cli.main(["publish-local", "local", str(source)])
 
 
 def test_publish_local_command_reports_stale_expected_version(tmp_path, capsys):
