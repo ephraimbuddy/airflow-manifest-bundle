@@ -49,3 +49,9 @@ packages = ["src/airflow_manifest_bundle"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+required-version = "==0.16.0"
+
+[tool.ruff.per-file-target-version]
+"scripts/*.py" = "py311"
