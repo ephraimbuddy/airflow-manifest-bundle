@@ -29,7 +29,7 @@ changing runtime behavior — it defines the terms and the safety argument.
 ```bash
 uv venv && uv pip install "apache-airflow==3.3.0" pytest -e .   # or 3.1.8
 .venv/bin/python -m pytest -q            # full suite, ~3s
-uvx ruff check src tests                 # lint
+uvx ruff==0.16.0 check src tests scripts # lint
 uv build && uvx twine check dist/*       # packaging sanity
 ```
 
