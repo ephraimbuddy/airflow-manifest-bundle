@@ -18,13 +18,28 @@ without requiring Git — it works like `GitDagBundle` does for commits:
 
 ## Install
 
+Maintainers currently publish versioned wheels through
+[GitHub Releases](https://github.com/ephraimbuddy/airflow-manifest-bundle/releases).
+Install the wheel in the same environment as Airflow. Set `AIRFLOW_VERSION` to the
+version in your deployment, and select a published bundle version:
+
 ```bash
-pip install .
+AIRFLOW_VERSION=3.3.0
+AIRFLOW_MANIFEST_BUNDLE_VERSION=0.1.0
+BUNDLE_WHEEL_URL="https://github.com/ephraimbuddy/airflow-manifest-bundle/releases/download/v${AIRFLOW_MANIFEST_BUNDLE_VERSION}/airflow_manifest_bundle-${AIRFLOW_MANIFEST_BUNDLE_VERSION}-py3-none-any.whl"
+
+python -m pip install \
+  "apache-airflow==${AIRFLOW_VERSION}" \
+  "airflow-manifest-bundle @ ${BUNDLE_WHEEL_URL}"
 ```
 
-Requires Apache Airflow 3.1 or newer, detected at import time with no configuration:
-on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on 3.1/3.2 it returns
-the plain version string those releases expect.
+The explicit Airflow pin prevents package installation from changing the Airflow
+version in your deployment. Install the same bundle wheel in each Airflow environment
+that loads the bundle and in the environment that runs the publisher.
+
+The bundle requires Apache Airflow 3.1 or newer, detected at import time with no
+configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
+3.1/3.2 it returns the plain version string those releases expect.
 
 ## Configure
 
@@ -125,13 +140,20 @@ runner just needs `/shared/dag-releases` mounted):
 deploy-dags:
   runs-on: [self-hosted, dag-deployer]
   env:
+    AIRFLOW_VERSION: "3.3.0"
+    AIRFLOW_MANIFEST_BUNDLE_VERSION: "0.1.0"
     AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >
       [{"name": "my_dags",
         "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
         "kwargs": {"published_root": "/shared/dag-releases"}}]
   steps:
     - uses: actions/checkout@v4
-    - run: pip install "apache-airflow==<your Airflow version>" airflow-manifest-bundle
+    - name: Install the publisher
+      run: |
+        BUNDLE_WHEEL_URL="https://github.com/ephraimbuddy/airflow-manifest-bundle/releases/download/v${AIRFLOW_MANIFEST_BUNDLE_VERSION}/airflow_manifest_bundle-${AIRFLOW_MANIFEST_BUNDLE_VERSION}-py3-none-any.whl"
+        python -m pip install \
+          "apache-airflow==${AIRFLOW_VERSION}" \
+          "airflow-manifest-bundle @ ${BUNDLE_WHEEL_URL}"
 
     # Capture the released version FIRST: it is the optimistic-concurrency token that
     # stops an older pipeline run from clobbering a newer release at the end.
