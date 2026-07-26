@@ -251,3 +251,7 @@ pytest
 The test suite covers manifest hashing and determinism, snapshot publication and
 validation, cache materialization and self-healing, and the publisher CLI. It runs
 against an installed Airflow with no database required.
+
+Maintainers currently publish wheels and source distributions through GitHub Releases.
+See the [release process](docs/releasing.md) for the version, tag, build, publication,
+and verification steps.
