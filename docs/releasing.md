@@ -43,7 +43,7 @@ The verification script:
 - checks the wheel and source distribution metadata;
 - installs the exact wheel that will become the release asset in a disposable
   environment;
-- runs the full test suite and command smoke tests against that wheel; and
+- runs the full test suite and an import smoke test against that wheel; and
 - confirms that the branch and commit did not change during verification.
 
 CI also tests the oldest supported Airflow version. Do not release unless the complete
@@ -87,7 +87,8 @@ uv pip install \
   "apache-airflow==3.3.0" \
   "airflow-manifest-bundle @ https://github.com/ephraimbuddy/airflow-manifest-bundle/releases/download/v${PROJECT_VERSION}/airflow_manifest_bundle-${PROJECT_VERSION}-py3-none-any.whl"
 
-"${PUBLISHED_RELEASE_CHECK_DIR}/venv/bin/airflow-manifest-bundle" publish-local --help
+"${PUBLISHED_RELEASE_CHECK_DIR}/venv/bin/python" -c \
+  "from airflow_manifest_bundle.local import ManifestLocalDagBundle"
 ```
 
 Users can use the same direct-reference form with `pip install`. Installing the wheel

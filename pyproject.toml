@@ -14,7 +14,6 @@ authors = [{ name = "Ephraim Anierobi", email = "ephraim@astronomer.io" }]
 keywords = ["airflow", "dag", "bundle", "deployment", "content-addressed", "manifest"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Environment :: Console",
     "Framework :: Apache Airflow",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
@@ -37,9 +36,6 @@ dependencies = [
 Homepage = "https://github.com/ephraimbuddy/airflow-manifest-bundle"
 Repository = "https://github.com/ephraimbuddy/airflow-manifest-bundle"
 Issues = "https://github.com/ephraimbuddy/airflow-manifest-bundle/issues"
-
-[project.scripts]
-airflow-manifest-bundle = "airflow_manifest_bundle.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

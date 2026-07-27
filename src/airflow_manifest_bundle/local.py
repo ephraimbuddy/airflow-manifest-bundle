@@ -107,15 +107,13 @@ class ManifestLocalDagBundle(BaseDagBundle):
     """
     Local Dag bundle that consumes a published content-addressed bundle manifest reference.
 
-    This bundle never parses Dags from a mutable local directory. Snapshots can be
-    published explicitly with :func:`publish_manifest_local_dag_bundle`, or automatically
-    from ``source_path`` during an unpinned refresh. Airflow materializes published
-    snapshots into its normal, disposable ``versions_dir`` cache before parsing or
-    execution.
+    This bundle never parses Dags from a mutable local directory. An unpinned refresh
+    publishes snapshots from ``source_path``. Airflow materializes published snapshots
+    into its normal, disposable ``versions_dir`` cache before parsing or execution.
 
     :param published_root: Shared root containing published snapshots and the current release reference.
     :param source_path: Optional mutable source directory to publish automatically.
-        When unset, the bundle only consumes explicitly published releases.
+        When unset, the bundle only consumes releases that already exist.
     :param source_stability_seconds: How long source metadata must remain unchanged
         before automatic publication. Defaults to ``refresh_interval``. Set to zero
         only when the deployment process updates the source atomically.
@@ -762,7 +760,7 @@ class ManifestLocalDagBundle(BaseDagBundle):
             self.manifest_ref_path,
             missing_message=(
                 f"Bundle '{self.name}' manifest reference file {self.manifest_ref_path} is missing. "
-                "Run the bundle publisher before refreshing this bundle."
+                "Configure source_path or restore the release reference before refreshing this bundle."
             ),
             invalid_message=f"Local bundle manifest reference is not valid JSON: {self.manifest_ref_path}",
         )

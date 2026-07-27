@@ -14,9 +14,8 @@ changing runtime behavior — it defines the terms and the safety argument.
 
 - `src/airflow_manifest_bundle/manifest.py` — content-addressing core: hashing, manifest
   schema, validation. Shared by all (current and future) backends.
-- `src/airflow_manifest_bundle/local.py` — `ManifestLocalDagBundle` plus automatic and
-  explicit publication for the local/shared-filesystem backend.
-- `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
+- `src/airflow_manifest_bundle/local.py` — `ManifestLocalDagBundle` plus publication
+  logic for the local/shared-filesystem backend.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
 - `tests/` — pytest suite; no database, no scheduler, no network required.
@@ -81,8 +80,8 @@ non-editable on purpose — it validates the packaged wheel — so do not "fix" 
 - Commit messages: imperative subject line, then prose paragraphs explaining motivation
   and verification (see `git log`).
 - New manifest backends extend this package rather than becoming new packages: one
-  module (e.g. `s3.py`), one CLI subcommand (e.g. `publish-s3`), one optional-dependency
-  group in `pyproject.toml`. All backends share `manifest.py` and its version calculus.
+  module (e.g. `s3.py`) and one optional-dependency group in `pyproject.toml`. All
+  backends share `manifest.py` and its version calculus.
 - The README is conversational; `docs/design.md` is strict STE. Keep both in the shared
   vocabulary defined by the design doc's terms table (snapshot, manifest, release
   reference, cache copy, marker).

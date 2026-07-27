@@ -19,9 +19,9 @@ one solution, but not all deployments can use Git.
 ## 3. Solution summary
 
 The package divides "a change to a file" from "a deployment". A publisher writes an
-immutable snapshot of the Dag files. The bundle can run the publisher during a
-refresh. A command can also run the publisher. Airflow reads only published
-snapshots. A change to a source file has no effect until a publication.
+immutable snapshot of the Dag files. The bundle runs the publisher during a refresh.
+Airflow reads only published snapshots. A change to a source file has no effect until
+a publication.
 
 The version of each snapshot is a hash of its content. Airflow keeps this version
 with each Dag run. When a task runs again, the bundle finds the same snapshot from
@@ -47,12 +47,11 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has four modules:
+The package has three modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
-- `local.py` — contains `ManifestLocalDagBundle` and the automatic and explicit
-  publication code for the local backend.
-- `cli.py` — the console script. It supplies the `publish-local` subcommand.
+- `local.py` — contains `ManifestLocalDagBundle` and the publication code for the
+  local backend.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
 
@@ -93,15 +92,9 @@ with the `.pyc` extension, and the manifest file itself.
 
 ## 8. The publication procedure
 
-The command gets the publication lock first. Other publishers wait. It compares
-`--expected-current-version` with the release reference when the operator gives this
-option. If the values are different, it stops with an error. It then reads the
-source tree and makes the manifest.
-
-The automatic publisher makes the manifest after its source stability check. It then
-gets the publication lock and reads the release reference again.
-
-Both publisher modes then do these steps:
+The publisher makes the manifest after its source stability check. It then gets the
+publication lock and reads the release reference again. Other publishers wait.
+The publisher then does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
    snapshot does not exist, it copies each file into a temporary folder, checks each
@@ -119,8 +112,6 @@ These properties follow from the procedure:
 - **Atomic.** The reference changes last. If the publisher stops at an earlier step,
   the previous release stays active.
 - **Serialized.** The lock permits one publisher at a time for each bundle.
-- **Ordered.** In explicit mode, the `--expected-current-version` option prevents an
-  old, slow deployment from a move of the reference backwards.
 
 The publisher does not use the Airflow metadata database.
 
@@ -246,7 +237,6 @@ exception types can stop the processor. Thus:
 - The public entry points (`initialize`, `refresh`, `get_current_version`, `path`)
   change an unplanned `OSError` into a `BundleManifestError`.
 
-The CLI catches these errors, writes one line to stderr, and stops with exit code 2.
 During automatic publication, the bundle keeps the current release when these errors
 occur. If no current release exists, the error stays visible to Airflow.
 
@@ -267,7 +257,10 @@ The publisher sets permissions only on directories that it makes. A published ro
 that an administrator made before keeps its permissions.
 
 An automatic publisher must have read access to the source tree and write access to
-the published root. A pinned bundle needs only read access to the published root.
+the bundle folders in the published root. All automatic publishers must use one
+writer identity. An administrator can also give each publisher write access with
+ownership or ACLs. Write access to the root does not give access to old child folders.
+A pinned bundle needs only read access to the published root.
 
 ## 13. Compatibility
 
@@ -278,11 +271,10 @@ installed Airflow at import time:
 - On Airflow 3.1 and 3.2, it returns the version as a string, because those releases
   know only strings.
 
-The files on disk are the contract between the publisher and the runtime. The
-release reference, manifest, and candidate state contain a `schema_version` field.
-The two sides do not exchange Python objects, so their patch versions can be
-different. A change to a file format that is not compatible must use a new schema
-version.
+The files on disk are the contract between bundle processes. The release reference,
+manifest, and candidate state contain a `schema_version` field. The processes do not
+exchange Python objects, so their patch versions can be different. A change to a file
+format that is not compatible must use a new schema version.
 
 ## 14. Known limits
 
@@ -306,8 +298,7 @@ version.
 The package is one family: manifest bundles. Each storage backend is one module.
 
 - A new backend adds one module (for example, `gcs.py` with `ManifestGCSDagBundle`),
-  one CLI subcommand (for example, `publish-gcs`), and one optional-dependency group
-  in `pyproject.toml`.
+  and one optional-dependency group in `pyproject.toml`.
 - All backends share `manifest.py`. The version calculation stays the same for all
   backends.
 - The release reference records the backend in its `backend.type` field. Schema

@@ -293,7 +293,6 @@ def build_and_validate(
     with tempfile.TemporaryDirectory(prefix="airflow-manifest-bundle-release-wheel-") as temp_dir:
         venv_dir = Path(temp_dir) / "venv"
         venv_python = venv_dir / "bin" / "python"
-        console_script = venv_dir / "bin" / "airflow-manifest-bundle"
         run_command(["uv", "venv", "--python", python, venv_dir])
         run_command(
             [
@@ -315,7 +314,6 @@ def build_and_validate(
                 "from airflow_manifest_bundle.local import ManifestLocalDagBundle",
             ]
         )
-        run_command([console_script, "publish-local", "--help"])
     return artifacts
 
 
