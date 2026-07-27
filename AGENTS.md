@@ -14,8 +14,8 @@ changing runtime behavior — it defines the terms and the safety argument.
 
 - `src/airflow_manifest_bundle/manifest.py` — content-addressing core: hashing, manifest
   schema, validation. Shared by all (current and future) backends.
-- `src/airflow_manifest_bundle/local.py` — `ManifestLocalDagBundle` plus the publication
-  function for the local/shared-filesystem backend.
+- `src/airflow_manifest_bundle/local.py` — `ManifestLocalDagBundle` plus automatic and
+  explicit publication for the local/shared-filesystem backend.
 - `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
@@ -60,12 +60,20 @@ non-editable on purpose — it validates the packaged wheel — so do not "fix" 
 5. **Validation markers skip only the checksum pass.** The structural check (file set,
    types, no symlinks) must still run once per process; it is what detects truncated or
    mutated cache trees.
-6. **The on-disk format is the compatibility contract.** `latest.json` and the embedded
-   manifest carry `schema_version`. Any incompatible format change requires a new schema
-   version, never a silent change to schema 1.
+6. **The on-disk format is the compatibility contract.** `latest.json`, the embedded
+   manifest, and automatic-publisher candidate state carry `schema_version`. Any
+   incompatible format change requires a new schema version, never a silent change to
+   schema 1.
 7. **Publication ordering.** The release reference is written last, atomically, after
    the snapshot is fully materialized and verified. A failed publish must leave the
    previous release active.
+8. **Automatic publication is fail-safe.** An automatic publication error must not
+   disrupt an existing release. Pinned bundles never publish. Candidate readiness is
+   shared under `published_root`; only the confirmed-source hashing hint stays in
+   process memory. Airflow's disposable cache stores neither.
+9. **One automatic source is authoritative.** All automatic publishers for one bundle
+   must observe the same source tree. The shared publication lock makes that safe and
+   idempotent; mixing automatic sources or manual reference changes is unsupported.
 
 ## Conventions
 

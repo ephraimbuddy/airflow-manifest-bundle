@@ -8,9 +8,11 @@ used: files can change after a Dag run is created, so its bundle version resolve
 `ManifestLocalDagBundle` gives shared-filesystem deployments reproducible pinned execution
 without requiring Git — it works like `GitDagBundle` does for commits:
 
-- A deploy step **publishes** an immutable, content-addressed snapshot of the Dag source
-  under a shared `published_root`. The bundle version is a SHA-256 content hash
-  (`sha256-<hex>`), and the release reference is updated atomically as the last step.
+- The bundle can **publish** an immutable, content-addressed snapshot automatically
+  after the Dag source stays unchanged for a configured interval. An explicit
+  publisher command remains available for CI-controlled releases.
+- The bundle version is a SHA-256 content hash (`sha256-<hex>`), and the release
+  reference is updated atomically as the last publication step.
 - Airflow **materializes** snapshots into its normal, disposable bundle cache before
   parsing or execution, validating path safety, integrity, and permissions.
 - Task retries and reruns **pin** through the existing `DagRun.bundle_version` field and
@@ -35,7 +37,8 @@ python -m pip install \
 
 The explicit Airflow pin prevents package installation from changing the Airflow
 version in your deployment. Install the same bundle wheel in each Airflow environment
-that loads the bundle and in the environment that runs the publisher.
+that loads the bundle and in any separate environment that runs the explicit
+publisher.
 
 The bundle requires Apache Airflow 3.1 or newer, detected at import time with no
 configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
@@ -51,7 +54,11 @@ dag_bundle_config_list = [
     {
       "name": "my_dags",
       "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
-      "kwargs": {"published_root": "/shared/dag-releases", "refresh_interval": 30}
+      "kwargs": {
+        "source_path": "/shared/dags",
+        "published_root": "/shared/dag-releases",
+        "refresh_interval": 30
+      }
     }
   ]
 ```
@@ -73,24 +80,73 @@ override, `AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`.
 
 Keep three locations separate and non-overlapping:
 
-- **the Dag source tree** — mutable, only ever read by the publisher command
+- **the Dag source tree** — mutable, read by the bundle's automatic publisher or by
+  the explicit publisher command
 - **`published_root`** — the authoritative publication area, a shared filesystem path
-  readable by the dag processor, workers, and the publisher
+  writable by the automatic or explicit publisher and readable by all Airflow
+  components
 - **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
 
-The bundle never scans a source directory at runtime, and editing source files changes
-nothing until the next publish: Airflow only follows the release reference.
+Airflow always parses and executes the immutable snapshot, never the mutable source
+tree. The optional `source_path` makes the unpinned bundle refresh act as the publisher.
+Omit `source_path` to keep publication separate from the Airflow runtime and use the
+CLI workflow described below.
 
-## Publish a release
+## Automatic publication
 
-The source directory is supplied only to the publisher:
+When `source_path` is configured, each unpinned bundle process checks source metadata
+during `refresh()`. A changed source must remain unchanged for
+`source_stability_seconds` before the bundle hashes and publishes it. The default
+stability period is `refresh_interval`; set it explicitly when you need a different
+delay:
 
-```bash
-airflow-manifest-bundle publish-local my_dags /path/to/dag/source --output json
+```ini
+"kwargs": {
+  "source_path": "/shared/dags",
+  "published_root": "/shared/dag-releases",
+  "refresh_interval": 30,
+  "source_stability_seconds": 60
+}
 ```
 
-The publisher builds a deterministic manifest of the source tree (ignoring `.git`,
-`__pycache__`, and `*.pyc`), then writes under `published_root`:
+The stability period uses elapsed time, not a count of refresh calls. Set
+`source_stability_seconds` to `0` only when your deployment tool replaces the whole
+source tree atomically. A metadata stability check cannot prove that a non-atomic sync
+has delivered every intended file, so a staging directory plus atomic rename is the
+safest source-delivery pattern.
+
+On the first start, when no release exists, initialization reports a recoverable
+bundle error until the source passes the stability period. After a release exists,
+an unstable, unreadable, empty, or failed publication leaves the current release
+active. Empty sources are rejected by default; set `"allow_empty_source": true` only
+when publishing an empty bundle is intentional.
+
+Automatic publication has these operational requirements:
+
+- Each unpinned dag processor that uses `source_path` must be able to read that path
+  and write to `published_root`. Workers that load pinned versions need only read
+  `published_root`.
+- All automatic publishers for one bundle must observe the same source tree. The
+  shared publication lock makes those publishers safe and idempotent.
+- Dag-processor hosts must keep their clocks synchronized. Replicas use one shared
+  UTC timestamp to measure the source stability period; a host that sees a timestamp
+  in the future waits instead of publishing early.
+- `source_path` is authoritative. Do not mix automatic publication with a different
+  source or with manual reference changes for the same bundle. An automatic publisher
+  can move the release reference back to the version of its source.
+- Pinned task, retry, callback, and rerun bundles never publish. They materialize only
+  the exact version Airflow gives them.
+
+In steady state, a refresh walks file metadata but does not read file contents. A
+process hashes the source once after it observes a new stable metadata signature.
+Replicas share the first-observed signature and timestamp under `published_root`, so
+any replica can complete the stability period. The full-hash confirmation remains a
+process-local optimization: a restarted process hashes the stable source once, but
+does not restart an already elapsed shared stability period. Airflow's disposable
+cache stores no publisher state.
+
+Both publication modes use the same snapshots and release reference. Automatic mode
+adds one shared candidate-state file:
 
 ```text
 versions/my_dags/sha256-<hex>/            immutable snapshot (read-only, world-readable)
@@ -98,7 +154,26 @@ versions/my_dags/sha256-<hex>/            immutable snapshot (read-only, world-r
     .airflow-bundle-manifest.json         full manifest embedded in the snapshot
 refs/my_dags/latest.json                  compact release reference — updated last, atomically
 _locks/my_dags.lock                       cross-host publication lock
+_state/my_dags/auto-publish.json          shared stability candidate (automatic mode)
 ```
+
+The release reference changes only after the snapshot is complete and verified. If
+automatic publication fails after an earlier release exists, the bundle logs the
+error and continues to serve that release. The candidate state is an atomic,
+schema-versioned coordination hint; it never selects the release that Airflow serves.
+
+## Explicit publication
+
+Omit `source_path` from the bundle configuration when CI or a release manager must
+control the exact publication point. Supply the source directory to the publisher:
+
+```bash
+airflow-manifest-bundle publish-local my_dags /path/to/dag/source --output json
+```
+
+The publisher builds a deterministic manifest of the source tree (ignoring `.git`,
+`__pycache__`, and `*.pyc`) and writes the same snapshot and release-reference format
+as the automatic publisher.
 
 The version is the SHA-256 content hash of the manifest entries, and the `--output json`
 result reports it along with `version_path`, `manifest_ref_path`, `file_count`,
@@ -109,15 +184,15 @@ that copy, and initialization rematerializes it from `published_root`.
 The publisher and the Airflow runtime can run as different OS users: snapshots are
 world-readable and read-only. The publisher chmods only directories it creates — a
 pre-provisioned `published_root` keeps its permissions, so make it readable by the
-Airflow components.
+Airflow components and writable by the publisher.
 
-## Deploying: the publish command is the deploy
+## CI-controlled deployment
 
 With a plain dags folder, "deploy" happens implicitly the moment files land in the
 folder — Airflow can see half-synced state, and a retry can pick up files that changed
-after the run started. With this bundle, copying files deploys nothing. Your existing
+after the run started. In explicit mode, copying files deploys nothing. Your existing
 workflow stays the same — edit, push, let your deploy tool deliver the files — and
-gains exactly one command at the end:
+gains one command at the end:
 
 ```bash
 airflow-manifest-bundle publish-local my_dags ./dags
@@ -209,19 +284,22 @@ airflow dags list-import-errors --local --bundle-name my_dags --output table
 ```
 
 `--local` parses straight from the bundle (no scheduler needed) and reads the
-materialized cache copy — never the source tree. Editing source files without
-publishing changes nothing; after a publish, the same command shows the new Dags.
+materialized cache copy — never the source tree. A source edit never changes the
+files that Airflow parses in place: explicit mode requires the publisher command,
+and automatic mode waits for source stability before it publishes a new snapshot.
 Persisted `DagVersion.bundle_version` values match the published version string.
 
-Two operational notes: if the release reference is missing, initialization fails with
-an error telling you to run the publisher; and the per-host `.sha256-<hex>.validated`
-marker files next to cache entries let repeat validations skip the checksum pass —
-delete them to force a full re-validation.
+Two operational notes: if the release reference is missing and `source_path` is not
+configured, initialization fails with an error telling you to run the publisher. If
+automatic publication is configured, the first initialization waits for source
+stability instead. The per-host `.sha256-<hex>.validated` marker files next to cache
+entries let repeat validations skip the checksum pass — delete them to force a full
+re-validation.
 
 The on-disk files are the compatibility contract between publisher and runtime: both
 sides implement the manifest `schema_version` they read and write, so their patch
-versions need not match. Publish from an image aligned with your target Airflow
-release rather than assuming an older CLI can write a newer schema.
+versions need not match. Run the publisher from a package version aligned with the
+runtime rather than assuming an older package can write a newer schema.
 
 The full design — terms, storage layout, publication procedure, runtime operation,
 error contract, and extension plan — is in [docs/design.md](docs/design.md).
@@ -252,8 +330,13 @@ what core actually does at runtime:
 - **Callback safety.** For callbacks without a pinned version, `path` falls back to the
   newest validated cached version when the just-published release is not materialized
   yet (otherwise the callback would be lost — core deletes callback rows before parsing).
-- **Standalone publisher CLI.** External packages cannot add `airflow` subcommands, so
-  publishing ships as the `airflow-manifest-bundle` console script.
+- **Two publication modes.** `source_path` lets the bundle publish during an unpinned
+  refresh. External packages cannot add `airflow` subcommands, so explicit publication
+  ships as the `airflow-manifest-bundle` console script.
+- **Shared automatic-publisher coordination.** Airflow can run successive refreshes
+  in different dag-processor replicas, so the stability candidate lives under
+  `published_root`, protected by the publication lock. Only the confirmed-source
+  hashing optimization remains process-local.
 
 Known caveat: Airflow's task startup takes the bundle version lock only after
 `bundle.initialize()`, so a stale-cleanup race can remove a version mid-initialization;
@@ -270,9 +353,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The test suite covers manifest hashing and determinism, snapshot publication and
-validation, cache materialization and self-healing, and the publisher CLI. It runs
-against an installed Airflow with no database required.
+The test suite covers manifest hashing and determinism, automatic and explicit
+snapshot publication, validation, cache materialization and self-healing, and the
+publisher CLI. It runs against an installed Airflow with no database required.
 
 Maintainers currently publish wheels and source distributions through GitHub Releases.
 See the [release process](docs/releasing.md) for the version, tag, build, publication,

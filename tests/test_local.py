@@ -11,6 +11,7 @@ import pytest
 from _test_utils import conf_vars
 
 from airflow_manifest_bundle import local as local_bundle_module
+from airflow_manifest_bundle import manifest as manifest_module
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.local import (
     BundleManifestReferenceChangedError,
@@ -72,7 +73,6 @@ def _publish_manifest_local_bundle(
     )
     _write_manifest_ref(bundle.manifest_ref_path, result.ref_payload)
     return result
-
 
 
 class TestManifestLocalDagBundle:
@@ -1379,3 +1379,605 @@ class TestReviewRegressions:
                     pinned.initialize()
             finally:
                 storage_root.chmod(0o755)
+
+
+class TestManifestLocalDagBundleAutoPublish:
+    @pytest.fixture(autouse=True)
+    def _clear_validated_version_paths(self):
+        ManifestLocalDagBundle._validated_version_paths.clear()
+        yield
+        ManifestLocalDagBundle._validated_version_paths.clear()
+
+    def _bundle(self, tmp_path, *, stability=0, source=None, **kwargs):
+        source = source or tmp_path / "source"
+        source.mkdir(parents=True, exist_ok=True)
+        bundle = ManifestLocalDagBundle(
+            name="manifest-local",
+            published_root=str(tmp_path / "published"),
+            source_path=str(source),
+            source_stability_seconds=stability,
+            **kwargs,
+        )
+        return bundle, source
+
+    def test_source_stability_defaults_to_refresh_interval(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(
+                tmp_path,
+                stability=None,
+                refresh_interval=42,
+            )
+
+        assert bundle.source_path == source
+        assert bundle.source_stability_seconds == 42
+
+    @pytest.mark.parametrize("value", [-1, float("inf"), float("nan"), True, "30"])
+    def test_rejects_invalid_source_stability_seconds(self, tmp_path, value):
+        with (
+            conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+            pytest.raises(TypeError, match="source_stability_seconds"),
+        ):
+            ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                source_path=str(tmp_path / "source"),
+                source_stability_seconds=value,
+            )
+
+    def test_rejects_non_boolean_allow_empty_source(self, tmp_path):
+        with (
+            conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+            pytest.raises(TypeError, match="allow_empty_source"),
+        ):
+            ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                source_path=str(tmp_path / "source"),
+                allow_empty_source="false",
+            )
+
+    def test_bootstrap_waits_for_elapsed_stability_time(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path, stability=30)
+            _write_file(source, "dags/example.py", "print('dag')")
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+                    bundle.initialize()
+                assert not bundle.manifest_ref_path.exists()
+
+                clock.return_value = 129
+                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+                    bundle.initialize()
+                assert not bundle.manifest_ref_path.exists()
+
+                clock.return_value = 130
+                bundle.initialize()
+
+            assert bundle.manifest_ref_path.is_file()
+            assert (bundle.path / "dags/example.py").read_text() == "print('dag')"
+
+    def test_fresh_instance_uses_shared_bootstrap_stability_candidate(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            first, source = self._bundle(tmp_path, stability=30)
+            _write_file(source, "dags/example.py", "print('dag')")
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+                    first.initialize()
+
+                state_payload = json.loads(first.auto_publish_state_path.read_text())
+                assert set(state_payload) == {
+                    "schema_version",
+                    "bundle_name",
+                    "source_signature",
+                    "first_observed_at",
+                }
+                assert (
+                    state_payload["schema_version"]
+                    == local_bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION
+                )
+                assert state_payload["bundle_name"] == first.name
+                assert state_payload["source_signature"].startswith("sha256:")
+                assert state_payload["first_observed_at"] == 100
+                assert stat.S_IMODE(first.auto_publish_state_path.stat().st_mode) == 0o644
+                assert stat.S_IMODE(first.auto_publish_state_path.parent.stat().st_mode) == 0o755
+
+                second, _ = self._bundle(tmp_path, stability=30, source=source)
+                clock.return_value = 130
+                second.initialize()
+
+            assert second.manifest_ref_path.is_file()
+            assert (second.path / "dags/example.py").read_text() == "print('dag')"
+
+    def test_different_instance_can_publish_shared_stable_candidate(self, tmp_path):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                first.refresh()
+                assert _version_string(first.get_current_version()) == old.version
+
+                clock.return_value = 130
+                second.refresh()
+
+            assert _version_string(second.get_current_version()) != old.version
+            assert (second.path / "dags/example.py").read_text() == "print('new')"
+
+    def test_immediate_refresh_after_initialize_does_not_satisfy_stability_window(self, tmp_path):
+        source = tmp_path / "source"
+        _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            publisher = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=publisher, source_path=source)
+            _write_file(source, "dags/example.py", "print('new')")
+            bundle, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                bundle.initialize()
+                bundle.refresh()
+                assert _version_string(bundle.get_current_version()) == old.version
+
+                clock.return_value = 130
+                bundle.refresh()
+
+            assert _version_string(bundle.get_current_version()) != old.version
+            assert (bundle.path / "dags/example.py").read_text() == "print('new')"
+
+    def test_changed_candidate_restarts_stability_timer(self, tmp_path):
+        source = tmp_path / "source"
+        _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            publisher = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=publisher, source_path=source)
+            bundle, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                _write_file(source, "dags/example.py", "print('candidate one')")
+                bundle.refresh()
+
+                clock.return_value = 120
+                _write_file(source, "dags/example.py", "print('candidate two')")
+                bundle.refresh()
+
+                clock.return_value = 149
+                bundle.refresh()
+                assert _version_string(bundle.get_current_version()) == old.version
+
+                clock.return_value = 150
+                bundle.refresh()
+
+            assert _version_string(bundle.get_current_version()) != old.version
+            assert (bundle.path / "dags/example.py").read_text() == "print('candidate two')"
+
+    def test_different_instances_share_candidate_reset(self, tmp_path):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+            third, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                source_file.write_text("print('candidate one')")
+                first.refresh()
+
+                clock.return_value = 120
+                source_file.write_text("print('candidate two')")
+                second.refresh()
+
+                clock.return_value = 149
+                first.refresh()
+                assert _version_string(first.get_current_version()) == old.version
+
+                clock.return_value = 150
+                third.refresh()
+
+            assert _version_string(third.get_current_version()) != old.version
+            assert (third.path / "dags/example.py").read_text() == "print('candidate two')"
+
+    def test_revert_to_confirmed_source_resets_shared_candidate(self, tmp_path):
+        source_a = tmp_path / "source-a"
+        source_b = tmp_path / "source-b"
+        source_link = tmp_path / "source"
+        _write_file(source_a, "dags/example.py", "print('source a')")
+        _write_file(source_b, "dags/example.py", "print('source b')")
+        _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+                    bundle.initialize()
+
+                clock.return_value = 130
+                bundle.initialize()
+                confirmed_version = _version_string(bundle.get_current_version())
+
+                source_link.unlink()
+                _create_symlink_or_skip(source_b, source_link, target_is_directory=True)
+                clock.return_value = 140
+                bundle.refresh()
+
+                source_link.unlink()
+                _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
+                clock.return_value = 150
+                bundle.refresh()
+                reverted_state = json.loads(bundle.auto_publish_state_path.read_text())
+                assert reverted_state["first_observed_at"] == 150
+
+                source_link.unlink()
+                _create_symlink_or_skip(source_b, source_link, target_is_directory=True)
+                clock.return_value = 170
+                bundle.refresh()
+
+            candidate_state = json.loads(bundle.auto_publish_state_path.read_text())
+            assert candidate_state["first_observed_at"] == 170
+            assert _version_string(bundle.get_current_version()) == confirmed_version
+
+    def test_delayed_observation_cannot_overwrite_newer_candidate(self, tmp_path):
+        source_a = tmp_path / "source-a"
+        source_b = tmp_path / "source-b"
+        source_link = tmp_path / "source"
+        _write_file(source_a, "dags/example.py", "print('source a')")
+        _write_file(source_b, "dags/example.py", "print('source b')")
+        _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+                    bundle.initialize()
+                original_state = json.loads(bundle.auto_publish_state_path.read_text())
+
+                source_link.unlink()
+                _create_symlink_or_skip(source_b, source_link, target_is_directory=True)
+                delayed_signature = local_bundle_module.collect_bundle_source_snapshot(
+                    source_link
+                ).signature
+
+                source_link.unlink()
+                _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
+                clock.return_value = 110
+                with pytest.raises(BundleManifestSourceChangedError, match="candidate was recorded"):
+                    bundle._auto_publish_candidate_is_ready(delayed_signature)
+
+            assert json.loads(bundle.auto_publish_state_path.read_text()) == original_state
+
+    def test_missing_reference_is_restored_from_confirmed_source(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            _write_file(source, "dags/example.py", "print('dag')")
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+
+            bundle.manifest_ref_path.unlink()
+            bundle.refresh()
+
+            assert json.loads(bundle.manifest_ref_path.read_text())["version"] == version
+            assert _version_string(bundle.get_current_version()) == version
+
+    def test_missing_published_snapshot_is_restored_from_confirmed_source(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            _write_file(source, "dags/example.py", "print('dag')")
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+            published_version_path = bundle.published_versions_dir / version
+
+            remove_bundle_tree_forcefully(published_version_path)
+            bundle.refresh()
+
+            assert published_version_path.is_dir()
+            assert json.loads(bundle.manifest_ref_path.read_text())["version"] == version
+
+    def test_publish_failure_keeps_serving_current_release(self, tmp_path, caplog):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            _write_file(source, "dags/example.py", "print('old')")
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+            _write_file(source, "dags/example.py", "print('new')")
+
+            with (
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
+                mock.patch.object(
+                    local_bundle_module,
+                    "_publish_manifest_result",
+                    side_effect=BundleManifestError("publish failed"),
+                ),
+            ):
+                bundle.refresh()
+
+            assert "keeping the current release" in caplog.text
+            assert _version_string(bundle.get_current_version()) == version
+            assert (bundle.path / "dags/example.py").read_text() == "print('old')"
+
+    def test_another_instance_retries_failed_ready_candidate_without_delay(self, tmp_path):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+            third, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                first.refresh()
+
+                clock.return_value = 130
+                with mock.patch.object(
+                    local_bundle_module,
+                    "_publish_manifest_result",
+                    side_effect=BundleManifestError("publish failed"),
+                ):
+                    second.refresh()
+                assert _version_string(second.get_current_version()) == old.version
+
+                clock.return_value = 131
+                third.refresh()
+
+            assert _version_string(third.get_current_version()) != old.version
+            assert (third.path / "dags/example.py").read_text() == "print('new')"
+
+    def test_candidate_is_rechecked_before_publication(self, tmp_path):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+            build_manifest = local_bundle_module.build_bundle_version_manifest_result
+
+            def build_manifest_then_replace_candidate(**kwargs):
+                result = build_manifest(**kwargs)
+                state_payload = json.loads(second.auto_publish_state_path.read_text())
+                state_payload["source_signature"] = "sha256:another-candidate"
+                second.auto_publish_state_path.write_text(json.dumps(state_payload))
+                return result
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                first.refresh()
+
+                clock.return_value = 130
+                with mock.patch.object(
+                    local_bundle_module,
+                    "build_bundle_version_manifest_result",
+                    side_effect=build_manifest_then_replace_candidate,
+                ):
+                    second.refresh()
+
+            assert _version_string(second.get_current_version()) == old.version
+            assert json.loads(second.auto_publish_state_path.read_text())["source_signature"] == (
+                "sha256:another-candidate"
+            )
+
+    @pytest.mark.parametrize("state_content", ["{", "{}"])
+    def test_malformed_shared_state_restarts_stability_period(self, tmp_path, state_content):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+                first.refresh()
+                first.auto_publish_state_path.write_text(state_content)
+
+                clock.return_value = 130
+                second.refresh()
+
+            state_payload = json.loads(second.auto_publish_state_path.read_text())
+            assert state_payload["first_observed_at"] == 130
+            assert _version_string(second.get_current_version()) == old.version
+
+    def test_unsupported_shared_state_schema_keeps_current_release(self, tmp_path, caplog):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            bundle, _ = self._bundle(tmp_path, stability=30, source=source)
+            bundle.auto_publish_state_path.parent.mkdir(parents=True)
+            bundle.auto_publish_state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": local_bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION + 1,
+                        "bundle_name": bundle.name,
+                        "source_signature": "sha256:future",
+                        "first_observed_at": 100,
+                    }
+                )
+            )
+
+            with (
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
+                mock.patch.object(local_bundle_module.time, "time", return_value=130),
+            ):
+                bundle.refresh()
+
+            assert "unsupported schema_version" in caplog.text
+            assert json.loads(bundle.auto_publish_state_path.read_text())["schema_version"] == 2
+            assert _version_string(bundle.get_current_version()) == old.version
+
+    def test_future_shared_timestamp_does_not_publish_early(self, tmp_path, caplog):
+        source = tmp_path / "source"
+        source_file = _write_file(source, "dags/example.py", "print('old')")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            explicit = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            old = publish_manifest_local_dag_bundle(bundle=explicit, source_path=source)
+            source_file.write_text("print('new')")
+            first, _ = self._bundle(tmp_path, stability=30, source=source)
+            second, _ = self._bundle(tmp_path, stability=30, source=source)
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=200):
+                first.refresh()
+
+            with (
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
+                mock.patch.object(local_bundle_module.time, "time", return_value=130),
+            ):
+                second.refresh()
+
+            assert "timestamp is in the future" in caplog.text
+            assert _version_string(second.get_current_version()) == old.version
+            assert json.loads(second.auto_publish_state_path.read_text())["first_observed_at"] == 200
+
+    def test_source_change_during_publication_keeps_serving_current_release(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            source_file = _write_file(source, "dags/example.py", "print('old')")
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+            source_file.write_text("print('candidate')")
+            materialize = local_bundle_module._materialize_local_manifest_snapshot
+
+            def materialize_then_change_source(**kwargs):
+                materialize(**kwargs)
+                source_file.write_text("print('changed again')")
+
+            with mock.patch.object(
+                local_bundle_module,
+                "_materialize_local_manifest_snapshot",
+                side_effect=materialize_then_change_source,
+            ):
+                bundle.refresh()
+
+            assert _version_string(bundle.get_current_version()) == version
+            assert json.loads(bundle.manifest_ref_path.read_text())["version"] == version
+            assert (bundle.path / "dags/example.py").read_text() == "print('old')"
+
+    def test_confirmed_source_uses_metadata_only_until_it_changes(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            source_file = _write_file(source, "dags/example.py", "print('dag')")
+            bundle.initialize()
+            source_stat = source_file.stat()
+
+            with mock.patch.object(
+                manifest_module,
+                "compute_file_sha256",
+                wraps=manifest_module.compute_file_sha256,
+            ) as compute_sha256:
+                bundle.refresh()
+                assert compute_sha256.call_count == 0
+
+                os.utime(
+                    source_file,
+                    ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000_000),
+                )
+                bundle.refresh()
+                assert compute_sha256.call_count == 1
+
+                bundle.refresh()
+                assert compute_sha256.call_count == 1
+
+    def test_pinned_bundle_never_publishes_dirty_source(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, source = self._bundle(tmp_path)
+            _write_file(source, "dags/example.py", "print('old')")
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+            _write_file(source, "dags/new.py", "print('new')")
+
+            pinned = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                source_path=str(source),
+                source_stability_seconds=0,
+                version=version,
+            )
+            with mock.patch.object(
+                ManifestLocalDagBundle,
+                "_maybe_publish_from_source",
+                autospec=True,
+            ) as publish:
+                pinned.initialize()
+
+            publish.assert_not_called()
+            assert not (pinned.path / "dags/new.py").exists()
+            assert not pinned.auto_publish_state_path.exists()
+
+    def test_empty_source_requires_explicit_opt_in(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _ = self._bundle(tmp_path)
+            with pytest.raises(BundleManifestError, match="Refusing to auto-publish empty"):
+                bundle.initialize()
+            assert not bundle.manifest_ref_path.exists()
+
+            allowed, _ = self._bundle(
+                tmp_path,
+                source=tmp_path / "allowed-source",
+                allow_empty_source=True,
+            )
+            allowed.initialize()
+            assert json.loads(allowed.manifest_ref_path.read_text())["file_count"] == 0
+
+    def test_retargeted_source_overlap_keeps_current_release(self, tmp_path, caplog):
+        real_source = tmp_path / "real-source"
+        source_link = tmp_path / "source-link"
+        _write_file(real_source, "dags/example.py", "print('dag')")
+        _create_symlink_or_skip(real_source, source_link, target_is_directory=True)
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, _ = self._bundle(tmp_path, source=source_link)
+            bundle.initialize()
+            version = _version_string(bundle.get_current_version())
+
+            source_link.unlink()
+            _create_symlink_or_skip(
+                bundle.published_root,
+                source_link,
+                target_is_directory=True,
+            )
+            with caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"):
+                bundle.refresh()
+
+            assert "keeping the current release" in caplog.text
+            assert _version_string(bundle.get_current_version()) == version
+            assert json.loads(bundle.manifest_ref_path.read_text())["version"] == version

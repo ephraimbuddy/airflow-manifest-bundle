@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import stat
 import tempfile
+import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from fcntl import LOCK_EX, LOCK_UN, flock
@@ -30,6 +32,7 @@ from airflow_manifest_bundle.manifest import (
     BundleManifestError,
     BundleManifestNotFoundError,
     BundleManifestSourceChangedError,
+    BundleVersionManifest,
     build_bundle_version_manifest_result,
     build_ref_payload,
     collect_bundle_source_snapshot,
@@ -43,6 +46,8 @@ log = logging.getLogger(__name__)
 
 LOCAL_MANIFEST_BACKEND_TYPE = "local"
 SHA256_VERSION_PREFIX = "sha256-"
+AUTO_PUBLISH_STATE_SCHEMA_VERSION = 1
+AUTO_PUBLISH_STATE_FILE_NAME = "auto-publish.json"
 
 
 @contextmanager
@@ -90,15 +95,33 @@ class LocalBundlePublishResult:
     created_snapshot: bool
 
 
+@dataclass(frozen=True)
+class _AutoPublishCandidateState:
+    """Shared observation of one automatic-publication source signature."""
+
+    source_signature: str
+    first_observed_at: float
+
+
 class ManifestLocalDagBundle(BaseDagBundle):
     """
     Local Dag bundle that consumes a published content-addressed bundle manifest reference.
 
-    This bundle does not discover source files from a mutable local directory at runtime.
-    A deployment process publishes immutable snapshots under ``published_root``. Airflow materializes
-    those snapshots into its normal, disposable ``versions_dir`` cache before parsing or execution.
+    This bundle never parses Dags from a mutable local directory. Snapshots can be
+    published explicitly with :func:`publish_manifest_local_dag_bundle`, or automatically
+    from ``source_path`` during an unpinned refresh. Airflow materializes published
+    snapshots into its normal, disposable ``versions_dir`` cache before parsing or
+    execution.
 
     :param published_root: Shared root containing published snapshots and the current release reference.
+    :param source_path: Optional mutable source directory to publish automatically.
+        When unset, the bundle only consumes explicitly published releases.
+    :param source_stability_seconds: How long source metadata must remain unchanged
+        before automatic publication. Defaults to ``refresh_interval``. Set to zero
+        only when the deployment process updates the source atomically.
+    :param allow_empty_source: Permit automatic publication of a source tree with no
+        files. Off by default to prevent a failed or incomplete sync from deleting all
+        Dags from the current release.
     """
 
     supports_versioning = True
@@ -111,6 +134,9 @@ class ManifestLocalDagBundle(BaseDagBundle):
         self,
         *,
         published_root: str | None = None,
+        source_path: str | None = None,
+        source_stability_seconds: float | None = None,
+        allow_empty_source: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -131,7 +157,40 @@ class ManifestLocalDagBundle(BaseDagBundle):
 
         self.published_versions_dir = self.published_root / "versions" / self.name
         self.publication_lock_path = self.published_root / "_locks" / f"{self.name}.lock"
+        self.auto_publish_state_path = (
+            self.published_root / "_state" / self.name / AUTO_PUBLISH_STATE_FILE_NAME
+        )
+        self.source_path = Path(source_path) if source_path else None
+        if source_stability_seconds is None:
+            source_stability_seconds = float(self.refresh_interval)
+        if (
+            isinstance(source_stability_seconds, bool)
+            or not isinstance(source_stability_seconds, (int, float))
+            or not math.isfinite(source_stability_seconds)
+            or source_stability_seconds < 0
+        ):
+            raise TypeError("source_stability_seconds must be a finite number greater than or equal to zero")
+        self.source_stability_seconds = float(source_stability_seconds)
+        if not isinstance(allow_empty_source, bool):
+            raise TypeError("allow_empty_source must be a boolean")
+        self.allow_empty_source = allow_empty_source
+        if self.source_path is not None:
+            try:
+                _validate_local_publish_paths(
+                    source_path=self.source_path,
+                    published_root=self.published_root,
+                    versions_dir=self.versions_dir,
+                )
+            except ValueError as e:
+                # Stock callback preparation treats ValueError as "bundle removed" and
+                # silently drops the callback. TypeError is the normal bad-kwarg signal.
+                raise TypeError(str(e)) from e
         self._current_manifest_ref: LocalBundleManifestRef | None = None
+        # This is only a per-process hashing optimization. Source readiness is shared
+        # under published_root because Airflow can run successive refreshes in different
+        # dag-processor replicas. The disposable Airflow cache stores neither.
+        self._confirmed_source_signature: str | None = None
+        self._confirmed_source_version: str | None = None
 
     def get_current_version(self) -> Any:
         """
@@ -163,7 +222,12 @@ class ManifestLocalDagBundle(BaseDagBundle):
             raise ValueError("Refreshing a specific bundle version is not supported")
 
         with _oserror_as_manifest_error():
-            manifest_ref = self._read_current_manifest_ref()
+            manifest_ref = self._read_current_manifest_ref_or_none()
+            if self.source_path is not None:
+                manifest_ref = self._maybe_publish_from_source(manifest_ref)
+            if manifest_ref is None:
+                # Use the established missing-reference error and message.
+                manifest_ref = self._read_current_manifest_ref()
             # Lock-free fast path: a validated cache tree is immutable, so the steady state
             # must not contend with another process's materialization of a different version.
             # Known limitation: a concurrent corrupt-cache rebuild can move the tree aside
@@ -174,6 +238,314 @@ class ManifestLocalDagBundle(BaseDagBundle):
             with self.lock():
                 self._materialize_cached_version(version=manifest_ref.version, manifest_ref=manifest_ref)
                 self._current_manifest_ref = manifest_ref
+
+    def _maybe_publish_from_source(
+        self,
+        current_ref: LocalBundleManifestRef | None,
+    ) -> LocalBundleManifestRef | None:
+        """Publish a stable source change without disrupting an existing release."""
+        try:
+            return self._publish_from_source_if_ready(current_ref)
+        except BundleManifestSourceChangedError:
+            fallback_ref = current_ref or self._read_current_manifest_ref_or_none()
+            if fallback_ref is None:
+                raise
+            log.debug(
+                "Bundle source changed while auto-publishing; keeping the current release. "
+                "bundle=%s source=%s",
+                self.name,
+                self.source_path,
+            )
+            return fallback_ref
+        except (BundleManifestError, OSError):
+            fallback_ref = current_ref or self._read_current_manifest_ref_or_none()
+            if fallback_ref is None:
+                raise
+            log.warning(
+                "Auto-publishing the bundle source failed; keeping the current release. "
+                "bundle=%s source=%s",
+                self.name,
+                self.source_path,
+                exc_info=True,
+            )
+            return fallback_ref
+
+    def _publish_from_source_if_ready(
+        self,
+        current_ref: LocalBundleManifestRef | None,
+    ) -> LocalBundleManifestRef | None:
+        source_path = self.source_path
+        if source_path is None:
+            return current_ref
+        self._validate_auto_publish_paths()
+        snapshot = collect_bundle_source_snapshot(source_path)
+        signature = snapshot.signature
+        source_is_confirmed = signature == self._confirmed_source_signature
+        if source_is_confirmed and self.source_stability_seconds > 0:
+            self._ensure_auto_publish_candidate_matches(signature)
+
+        if (
+            source_is_confirmed
+            and current_ref is not None
+            and current_ref.version == self._confirmed_source_version
+            and self._published_snapshot_exists(current_ref.version)
+        ):
+            return current_ref
+
+        if (
+            not source_is_confirmed
+            and self.source_stability_seconds > 0
+            and not self._auto_publish_candidate_is_ready(signature)
+        ):
+            if current_ref is None:
+                raise BundleManifestError(
+                    f"Bundle source for '{self.name}' has not remained unchanged for "
+                    f"{self.source_stability_seconds:g} seconds; waiting before the first publication"
+                )
+            log.info(
+                "Bundle source changed; waiting until it has remained unchanged for %g seconds. "
+                "bundle=%s source=%s",
+                self.source_stability_seconds,
+                self.name,
+                self.source_path,
+            )
+            return current_ref
+
+        if not snapshot.files and not self.allow_empty_source:
+            raise BundleManifestError(
+                f"Refusing to auto-publish empty source tree {self.source_path} for bundle "
+                f"'{self.name}'; set allow_empty_source=True if removing every Dag is intended"
+            )
+
+        manifest_result = build_bundle_version_manifest_result(
+            bundle_name=self.name,
+            root=source_path,
+            backend_type=LOCAL_MANIFEST_BACKEND_TYPE,
+            source_snapshot=snapshot,
+        )
+        if (
+            current_ref is not None
+            and current_ref.version == manifest_result.version
+            and self._published_snapshot_exists(manifest_result.version)
+        ):
+            self._record_confirmed_source(signature, manifest_result.version)
+            return current_ref
+
+        self._validate_auto_publish_paths()
+        _ensure_public_dir(self.published_versions_dir)
+        _ensure_public_dir(self.manifest_ref_path.parent)
+        with self.acquire_publication_lock():
+            self._validate_auto_publish_paths()
+            if (
+                not source_is_confirmed
+                and self.source_stability_seconds > 0
+                and not self._auto_publish_candidate_remains_ready_locked(signature)
+            ):
+                raise BundleManifestSourceChangedError(
+                    "Bundle source stability candidate changed before automatic publication"
+                )
+            latest_ref = self._read_current_manifest_ref_or_none()
+            if (
+                latest_ref is not None
+                and latest_ref.version == manifest_result.version
+                and self._published_snapshot_exists(manifest_result.version)
+            ):
+                self._record_confirmed_source(signature, manifest_result.version)
+                return latest_ref
+            result = _publish_manifest_result(
+                bundle=self,
+                manifest_result=manifest_result,
+                source_path=source_path,
+            )
+
+        self._record_confirmed_source(signature, result.version)
+        log.info(
+            "Auto-published bundle source. bundle=%s version=%s file_count=%d total_size=%d "
+            "created_snapshot=%s",
+            self.name,
+            result.version,
+            result.file_count,
+            result.total_size,
+            result.created_snapshot,
+        )
+        return self._manifest_ref_from_payload(result.ref_payload, source="auto-publisher")
+
+    def _validate_auto_publish_paths(self) -> None:
+        if self.source_path is None:
+            return
+        try:
+            _validate_local_publish_paths(
+                source_path=self.source_path,
+                published_root=self.published_root,
+                versions_dir=self.versions_dir,
+            )
+        except ValueError as e:
+            raise BundleManifestError(str(e)) from e
+
+    def _record_confirmed_source(self, signature: str, version: str) -> None:
+        self._confirmed_source_signature = signature
+        self._confirmed_source_version = version
+
+    def _published_snapshot_exists(self, version: str) -> bool:
+        return (self.published_versions_dir / version).is_dir()
+
+    def _auto_publish_candidate_is_ready(self, source_signature: str) -> bool:
+        """Record or check shared source readiness under the publication lock."""
+        _ensure_public_dir(self.auto_publish_state_path.parent)
+        with self.acquire_publication_lock():
+            state = self._synchronize_auto_publish_candidate_locked(source_signature)
+            return self._auto_publish_candidate_elapsed(state, now=time.time())
+
+    def _ensure_auto_publish_candidate_matches(self, source_signature: str) -> None:
+        """Reset a stale shared candidate before taking the confirmed-source fast path."""
+        state = self._read_auto_publish_candidate_state_or_none()
+        if state is not None and state.source_signature == source_signature:
+            return
+        _ensure_public_dir(self.auto_publish_state_path.parent)
+        with self.acquire_publication_lock():
+            self._synchronize_auto_publish_candidate_locked(source_signature)
+
+    def _synchronize_auto_publish_candidate_locked(
+        self,
+        observed_signature: str,
+    ) -> _AutoPublishCandidateState:
+        """
+        Reconcile shared state with a source observation while holding the publication lock.
+
+        A replica can wait between its metadata walk and lock acquisition. Re-read the
+        source before replacing a different candidate so that an old observation cannot
+        overwrite a newer signature another replica recorded.
+        """
+        state = self._read_auto_publish_candidate_state_or_none()
+        if state is not None and state.source_signature == observed_signature:
+            return state
+
+        source_path = self.source_path
+        if source_path is None:
+            raise BundleManifestError("Automatic publication requires source_path")
+        current_snapshot = collect_bundle_source_snapshot(source_path)
+        now = time.time()
+        if state is None or state.source_signature != current_snapshot.signature:
+            state = _AutoPublishCandidateState(
+                source_signature=current_snapshot.signature,
+                first_observed_at=now,
+            )
+            self._write_auto_publish_candidate_state(state)
+        if current_snapshot.signature != observed_signature:
+            raise BundleManifestSourceChangedError(
+                "Bundle source changed before its automatic-publication candidate was recorded"
+            )
+        return state
+
+    def _auto_publish_candidate_remains_ready_locked(self, source_signature: str) -> bool:
+        """Check readiness again without replacing another publisher's candidate."""
+        state = self._read_auto_publish_candidate_state_or_none()
+        if state is None or state.source_signature != source_signature:
+            return False
+        return self._auto_publish_candidate_elapsed(state, now=time.time())
+
+    def _auto_publish_candidate_elapsed(
+        self,
+        state: _AutoPublishCandidateState,
+        *,
+        now: float,
+    ) -> bool:
+        elapsed = now - state.first_observed_at
+        if elapsed < 0:
+            log.warning(
+                "Automatic-publish candidate timestamp is in the future; waiting for clocks "
+                "to converge. bundle=%s candidate_timestamp=%s current_timestamp=%s",
+                self.name,
+                state.first_observed_at,
+                now,
+            )
+            return False
+        return elapsed >= self.source_stability_seconds
+
+    def _read_auto_publish_candidate_state_or_none(self) -> _AutoPublishCandidateState | None:
+        try:
+            payload = self._read_json_file(
+                self.auto_publish_state_path,
+                missing_message=f"Automatic-publish state is missing: {self.auto_publish_state_path}",
+                invalid_message=f"Automatic-publish state is not valid JSON: {self.auto_publish_state_path}",
+            )
+        except BundleManifestNotFoundError:
+            return None
+        except BundleManifestError:
+            log.warning(
+                "Automatic-publish state is malformed; restarting the source stability period. "
+                "bundle=%s path=%s",
+                self.name,
+                self.auto_publish_state_path,
+                exc_info=True,
+            )
+            return None
+
+        schema_version = payload.get("schema_version")
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version < 1
+        ):
+            log.warning(
+                "Automatic-publish state has an invalid schema version; restarting the source "
+                "stability period. bundle=%s path=%s",
+                self.name,
+                self.auto_publish_state_path,
+            )
+            return None
+        if schema_version != AUTO_PUBLISH_STATE_SCHEMA_VERSION:
+            raise BundleManifestError(
+                f"Automatic-publish state {self.auto_publish_state_path} has unsupported "
+                f"schema_version {schema_version!r}"
+            )
+        if payload.get("bundle_name") != self.name:
+            log.warning(
+                "Automatic-publish state has the wrong bundle name; restarting the source "
+                "stability period. bundle=%s path=%s",
+                self.name,
+                self.auto_publish_state_path,
+            )
+            return None
+        source_signature = payload.get("source_signature")
+        first_observed_at = payload.get("first_observed_at")
+        if (
+            not isinstance(source_signature, str)
+            or not source_signature
+            or isinstance(first_observed_at, bool)
+            or not isinstance(first_observed_at, (int, float))
+            or not math.isfinite(first_observed_at)
+            or first_observed_at < 0
+        ):
+            log.warning(
+                "Automatic-publish state has invalid candidate data; restarting the source "
+                "stability period. bundle=%s path=%s",
+                self.name,
+                self.auto_publish_state_path,
+            )
+            return None
+        return _AutoPublishCandidateState(
+            source_signature=source_signature,
+            first_observed_at=float(first_observed_at),
+        )
+
+    def _write_auto_publish_candidate_state(self, state: _AutoPublishCandidateState) -> None:
+        _remove_orphaned_atomic_temp_files(self.auto_publish_state_path)
+        _write_json_atomically(
+            self.auto_publish_state_path,
+            {
+                "schema_version": AUTO_PUBLISH_STATE_SCHEMA_VERSION,
+                "bundle_name": self.name,
+                "source_signature": state.source_signature,
+                "first_observed_at": state.first_observed_at,
+            },
+        )
+
+    def _read_current_manifest_ref_or_none(self) -> LocalBundleManifestRef | None:
+        try:
+            return self._read_current_manifest_ref()
+        except BundleManifestNotFoundError:
+            return None
 
     def _validation_marker_path(self, version: str) -> Path:
         # A file, not a directory: the orphan sweep only matches temp snapshot directories.
@@ -860,31 +1232,45 @@ def publish_manifest_local_dag_bundle(
             root=source_path,
             backend_type=LOCAL_MANIFEST_BACKEND_TYPE,
         )
-        manifest_ref = bundle._manifest_ref_from_payload(manifest_result.ref_payload, source="publisher")
-        version_path = bundle.published_versions_dir / manifest_result.version
+        return _publish_manifest_result(
+            bundle=bundle,
+            manifest_result=manifest_result,
+            source_path=source_path,
+        )
 
-        _remove_orphaned_local_manifest_temp_snapshots(bundle.published_versions_dir)
-        _remove_orphaned_manifest_ref_temp_files(bundle.manifest_ref_path)
-        created_snapshot = False
-        if version_path.exists():
-            if not version_path.is_dir():
-                raise FileExistsError(f"Bundle snapshot path exists but is not a directory: {version_path}")
-            bundle._validate_snapshot_for_ref(manifest_ref, version_path)
-        else:
-            _materialize_local_manifest_snapshot(
-                source_path=source_path,
-                manifest=manifest_result.manifest,
-                versions_dir=bundle.published_versions_dir,
-                version_path=version_path,
-            )
-            created_snapshot = True
 
-        final_source_snapshot = collect_bundle_source_snapshot(source_path)
-        if final_source_snapshot.signature != manifest_result.source_snapshot.signature:
-            raise BundleManifestSourceChangedError(
-                "Bundle source changed while publishing the local bundle snapshot"
-            )
-        _write_manifest_ref_atomically(bundle.manifest_ref_path, manifest_result.ref_payload)
+def _publish_manifest_result(
+    *,
+    bundle: ManifestLocalDagBundle,
+    manifest_result: BundleVersionManifest,
+    source_path: Path,
+) -> LocalBundlePublishResult:
+    """Publish a precomputed local manifest while the caller holds the publication lock."""
+    manifest_ref = bundle._manifest_ref_from_payload(manifest_result.ref_payload, source="publisher")
+    version_path = bundle.published_versions_dir / manifest_result.version
+
+    _remove_orphaned_local_manifest_temp_snapshots(bundle.published_versions_dir)
+    _remove_orphaned_atomic_temp_files(bundle.manifest_ref_path)
+    created_snapshot = False
+    if version_path.exists():
+        if not version_path.is_dir():
+            raise FileExistsError(f"Bundle snapshot path exists but is not a directory: {version_path}")
+        bundle._validate_snapshot_for_ref(manifest_ref, version_path)
+    else:
+        _materialize_local_manifest_snapshot(
+            source_path=source_path,
+            manifest=manifest_result.manifest,
+            versions_dir=bundle.published_versions_dir,
+            version_path=version_path,
+        )
+        created_snapshot = True
+
+    final_source_snapshot = collect_bundle_source_snapshot(source_path)
+    if final_source_snapshot.signature != manifest_result.source_snapshot.signature:
+        raise BundleManifestSourceChangedError(
+            "Bundle source changed while publishing the local bundle snapshot"
+        )
+    _write_manifest_ref_atomically(bundle.manifest_ref_path, manifest_result.ref_payload)
 
     return LocalBundlePublishResult(
         bundle_name=bundle.name,
@@ -992,11 +1378,11 @@ def _is_local_manifest_temp_snapshot_dir(path: Path) -> bool:
     )
 
 
-def _remove_orphaned_manifest_ref_temp_files(manifest_ref_path: Path) -> None:
-    if not manifest_ref_path.parent.exists():
+def _remove_orphaned_atomic_temp_files(destination_path: Path) -> None:
+    if not destination_path.parent.exists():
         return
-    prefix = f".{manifest_ref_path.name}."
-    for path in manifest_ref_path.parent.iterdir():
+    prefix = f".{destination_path.name}."
+    for path in destination_path.parent.iterdir():
         if not path.name.startswith(prefix) or path.is_symlink() or not path.is_file():
             continue
         with suppress(OSError):
@@ -1004,21 +1390,25 @@ def _remove_orphaned_manifest_ref_temp_files(manifest_ref_path: Path) -> None:
 
 
 def _write_manifest_ref_atomically(manifest_ref_path: Path, ref_payload: dict[str, Any]) -> None:
-    manifest_ref_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomically(manifest_ref_path, ref_payload)
+
+
+def _write_json_atomically(destination_path: Path, payload: dict[str, Any]) -> None:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{manifest_ref_path.name}.",
-        dir=manifest_ref_path.parent,
+        prefix=f".{destination_path.name}.",
+        dir=destination_path.parent,
     )
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as file:
-            file.write(serialize_bundle_version_manifest(ref_payload))
+            file.write(serialize_bundle_version_manifest(payload))
             file.flush()
             # mkstemp creates the file owner-only; consumers can run as a different OS user.
             os.fchmod(file.fileno(), 0o644)
             os.fsync(file.fileno())
-        os.replace(tmp_path, manifest_ref_path)
-        _fsync_directory(manifest_ref_path.parent)
+        os.replace(tmp_path, destination_path)
+        _fsync_directory(destination_path.parent)
     except Exception:
         # missing_ok: an exists()/unlink() pair could itself raise here (e.g. an external
         # tmp sweeper won the race) and mask the original publish error.
