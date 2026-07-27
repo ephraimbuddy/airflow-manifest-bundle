@@ -19,9 +19,9 @@ one solution, but not all deployments can use Git.
 ## 3. Solution summary
 
 The package divides "a change to a file" from "a deployment". A publisher writes an
-immutable snapshot of the Dag files. The bundle runs the publisher during a refresh.
-Airflow reads only published snapshots. A change to a source file has no effect until
-a publication.
+immutable snapshot of the Dag files. The bundle runs the publisher as part of each
+refresh. Airflow reads only published snapshots. A change to a source file has no
+effect until a publication.
 
 The version of each snapshot is a hash of its content. Airflow keeps this version
 with each Dag run. When a task runs again, the bundle finds the same snapshot from
@@ -92,9 +92,9 @@ with the `.pyc` extension, and the manifest file itself.
 
 ## 8. The publication procedure
 
-The publisher makes the manifest after its source stability check. It then gets the
-publication lock and reads the release reference again. Other publishers wait.
-The publisher then does these steps:
+After the source stability check, the publisher makes the manifest. The publisher
+then gets the publication lock. Other publishers wait for the publication lock.
+The publisher reads the release reference again. It then does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
    snapshot does not exist, it copies each file into a temporary folder, checks each
@@ -237,8 +237,8 @@ exception types can stop the processor. Thus:
 - The public entry points (`initialize`, `refresh`, `get_current_version`, `path`)
   change an unplanned `OSError` into a `BundleManifestError`.
 
-During automatic publication, the bundle keeps the current release when these errors
-occur. If no current release exists, the error stays visible to Airflow.
+If these errors occur in automatic publication, the bundle keeps the current release.
+If no current release exists, the error stays visible to Airflow.
 
 ## 12. Permissions and users
 
@@ -256,11 +256,12 @@ The publisher and the Airflow components can run as different OS users.
 The publisher sets permissions only on directories that it makes. A published root
 that an administrator made before keeps its permissions.
 
-An automatic publisher must have read access to the source tree and write access to
-the bundle folders in the published root. All automatic publishers must use one
-writer identity. An administrator can also give each publisher write access with
-ownership or ACLs. Write access to the root does not give access to old child folders.
-A pinned bundle needs only read access to the published root.
+An automatic publisher must have read access to the source tree. It must have write
+access to the bundle folders in the published root. All automatic publishers for one
+bundle must use the same OS user. Alternatively, an administrator must give write
+permission to each publisher. This permission must apply to all child folders that
+an earlier publisher created in the published root. A pinned bundle needs only read
+access to the published root.
 
 ## 13. Compatibility
 
@@ -271,10 +272,10 @@ installed Airflow at import time:
 - On Airflow 3.1 and 3.2, it returns the version as a string, because those releases
   know only strings.
 
-The files on disk are the contract between bundle processes. The release reference,
-manifest, and candidate state contain a `schema_version` field. The processes do not
-exchange Python objects, so their patch versions can be different. A change to a file
-format that is not compatible must use a new schema version.
+The files on disk define compatibility between bundle processes. The release
+reference, manifest, and candidate state contain a `schema_version` field. Bundle
+processes do not exchange Python objects. Thus, the processes can use different patch
+versions. An incompatible change to a file format must use a new schema version.
 
 ## 14. Known limits
 
@@ -297,7 +298,7 @@ format that is not compatible must use a new schema version.
 
 The package is one family: manifest bundles. Each storage backend is one module.
 
-- A new backend adds one module (for example, `gcs.py` with `ManifestGCSDagBundle`),
+- A new backend adds one module (for example, `gcs.py` with `ManifestGCSDagBundle`)
   and one optional-dependency group in `pyproject.toml`.
 - All backends share `manifest.py`. The version calculation stays the same for all
   backends.
