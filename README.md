@@ -11,7 +11,8 @@ reproducible pinned execution without requiring Git. They work like `GitDagBundl
 does for commits:
 
 - The bundle **publishes** an immutable, content-addressed snapshot automatically
-  after the Dag source stays unchanged for a configured interval.
+  after the Dag source stays unchanged for a configured interval, or through an
+  explicit local publisher command.
 - The bundle version is a SHA-256 content hash (`sha256-<hex>`), and the release
   reference is updated atomically as the last publication step.
 - Airflow **materializes** snapshots into its normal, disposable bundle cache before
@@ -38,7 +39,7 @@ python -m pip install \
 
 The explicit Airflow pin prevents package installation from changing the Airflow
 version in your deployment. Install the same bundle wheel in each Airflow environment
-that loads the bundle.
+that loads the bundle and on any host that runs the publisher command.
 
 For an S3 source, install the optional Amazon provider dependency:
 
@@ -132,6 +133,16 @@ or S3 mirror. `source_path` enables the local publisher. An unpinned S3 bundle a
 has an S3 publication source. A pinned bundle reads neither source and does not
 publish.
 
+For explicit local publication, omit `source_path` from the local bundle config. The
+publisher command receives the source path at deployment time:
+
+```ini
+"kwargs": {
+  "published_root": "/shared/dag-releases",
+  "refresh_interval": 30
+}
+```
+
 ## Automatic publication
 
 Each unpinned publisher checks source metadata during `refresh()`. A changed source
@@ -210,6 +221,29 @@ automatic publication fails after an earlier release exists, the bundle logs the
 error and continues to serve that release. The candidate state is an atomic,
 schema-versioned coordination hint; it never selects the release that Airflow serves.
 
+## Explicit local publication
+
+For a local bundle configured without `source_path`, publish a release directly:
+
+```bash
+airflow-manifest-bundle publish-local my_dags /path/to/dag/source --output json
+```
+
+The command reads the named bundle from Airflow configuration, creates or validates
+the content-addressed snapshot, and updates the release reference last. It does not
+need the Airflow metadata database. The publishing host needs the package, the bundle
+configuration, read access to the source, and write access to `published_root`.
+
+Use `--expected-current-version sha256-<hex>` after the first release to stop an
+older deployment from replacing a newer one. Omit that option for the first release,
+when no current version exists. The JSON result includes the version, snapshot and
+reference paths, manifest hash, file count, total size, and whether it created the
+snapshot.
+
+Do not use the explicit command for a bundle that has `source_path` configured or
+for an S3 bundle. An automatic source is authoritative and can replace a manual
+release.
+
 ## Deployment behavior
 
 With a plain dags folder, Airflow can see a half-synced deployment and a retry can
@@ -219,9 +253,9 @@ reference. Airflow continues to serve the previous release until that sequence
 succeeds.
 
 Publication is idempotent, atomic, and serialized by the shared lock under
-`published_root`. A deployment pipeline can deliver the source tree without access
-to the Airflow metadata database. The dag processor publishes it after the configured
-stability period.
+`published_root`. A deployment pipeline can deliver the source tree for automatic
+publication, or it can run the explicit local publisher command. Neither workflow
+needs access to the Airflow metadata database.
 
 **Retention**: Airflow never deletes from `published_root` — pruning old
 `versions/<bundle>/sha256-*` directories is a deliberate operation you schedule
@@ -285,6 +319,8 @@ what core actually does at runtime:
 - **Automatic publication.** `source_path` lets the bundle publish during an unpinned
   local refresh. The S3 adapter does the same from its isolated mirror. Pinned bundle
   instances only materialize the requested version.
+- **Standalone publisher CLI.** External packages cannot add `airflow` subcommands, so
+  explicit local publication uses the `airflow-manifest-bundle` console script.
 - **Shared automatic-publisher coordination.** Airflow can run successive refreshes
   in different dag-processor replicas, so the stability candidate lives under
   `published_root`, protected by the publication lock. Only the confirmed-source
@@ -306,8 +342,8 @@ pytest
 ```
 
 The test suite covers manifest hashing and determinism, local and S3 publication,
-S3 mirror safety, validation, and cache materialization and self-healing. It runs
-against an installed Airflow with no database required.
+the publisher CLI, S3 mirror safety, validation, and cache materialization and
+self-healing. It runs against an installed Airflow with no database required.
 
 Maintainers currently publish wheels and source distributions through GitHub Releases.
 See the [release process](docs/releasing.md) for the version, tag, build, publication,

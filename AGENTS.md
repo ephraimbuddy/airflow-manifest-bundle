@@ -19,6 +19,7 @@ safety argument.
   snapshot, cache, and validation lifecycle.
 - `src/airflow_manifest_bundle/local.py` — local source adapter.
 - `src/airflow_manifest_bundle/s3.py` — read-only S3 source and local mirror adapter.
+- `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
 - `tests/` — pytest suite; no database, no scheduler, no network required.

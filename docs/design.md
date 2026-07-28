@@ -22,9 +22,9 @@ one solution, but not all deployments can use Git.
 
 The package divides "a change to a file" from "a deployment". A source adapter
 prepares one local source tree. A common publisher writes an immutable snapshot of
-the Dag files. The bundle runs the publisher as part of each refresh. Airflow reads
-only published snapshots. A change to a source file has no effect until a
-publication.
+the Dag files. The bundle can run the publisher as part of each refresh. An operator
+can also run the local publisher command. Airflow reads only published snapshots.
+A change to a source file has no effect until a publication.
 
 The version of each snapshot is a hash of its content. Airflow keeps this version
 with each Dag run. When a task runs again, the bundle finds the same snapshot from
@@ -56,12 +56,13 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has five modules:
+The package has six modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
 - `bundle.py` — contains `ManifestDagBundleBase` and the common artifact lifecycle.
 - `local.py` — contains the local source adapter, `ManifestLocalDagBundle`.
 - `s3.py` — contains the S3 source adapter, `ManifestS3DagBundle`.
+- `cli.py` — contains the manual local publisher command.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
 
@@ -111,10 +112,11 @@ Each source adapter ignores these items: `.git`, `__pycache__`, files with the
 
 ## 8. The publication procedure
 
-After the source stability check, a source adapter returns a prepared source. The
-common publisher makes the manifest from this local tree. The publisher then gets
-the publication lock. Other publishers wait for the publication lock. The publisher
-reads the release reference again. It then does these steps:
+A source adapter returns a prepared source. Automatic publication first completes
+the source stability check. The manual local command does not do this check. The
+common publisher makes the manifest from the prepared local tree. The publisher then
+gets the publication lock. Other publishers wait for the publication lock. The
+publisher reads the release reference again. It then does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
    snapshot does not exist, it copies each file into a temporary folder, checks each
@@ -135,6 +137,22 @@ These properties follow from the procedure:
 - **Serialized.** The lock permits one publisher at a time for each bundle.
 
 The publisher does not use the Airflow metadata database.
+
+### 8.1 Manual local publication
+
+A local bundle can omit `source_path`. An operator can then run this command:
+
+```text
+airflow-manifest-bundle publish-local <bundle-name> <source-path>
+```
+
+The command reads the Airflow bundle configuration. It publishes the specified
+source tree to the configured published root. The `--expected-current-version`
+option stops an old deployment from replacing a newer release. The command can
+write its result as text or JSON.
+
+Do not use the command for a bundle that has an automatic source. The automatic
+source is authoritative and can replace a manual release.
 
 ## 9. Automatic publication
 
