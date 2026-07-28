@@ -261,6 +261,25 @@ def test_sync_normalizes_mirror_directories_once_before_and_after_downloads(
             assert directory.stat().st_mode & 0o777 == 0o755
 
 
+def test_normalizing_mirror_directories_rejects_symlink_without_chmodding_target(
+    tmp_path,
+):
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path)
+        bundle.s3_dags_dir.mkdir(parents=True)
+        outside_directory = tmp_path / "outside"
+        outside_directory.mkdir(mode=0o700)
+        (bundle.s3_dags_dir / "unsafe").symlink_to(
+            outside_directory,
+            target_is_directory=True,
+        )
+
+        with pytest.raises(BundleManifestError, match="unsafe directory"):
+            bundle._normalize_mirror_directories()
+
+        assert outside_directory.stat().st_mode & 0o777 == 0o700
+
+
 def test_unchanged_inventory_reuses_mirror_and_release(tmp_path, monkeypatch):
     client = FakeS3Client()
     client.put("dags/example.py", b"print('dag')")

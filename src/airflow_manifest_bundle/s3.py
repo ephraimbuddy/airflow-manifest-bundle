@@ -671,11 +671,40 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
                 path.rmdir()
 
     def _normalize_mirror_directories(self) -> None:
-        self.s3_dags_dir.chmod(0o755)
+        self._normalize_mirror_directory(self.s3_dags_dir)
         for dirpath, dirnames, _ in os.walk(self.s3_dags_dir, followlinks=False):
-            Path(dirpath).chmod(0o755)
+            self._normalize_mirror_directory(Path(dirpath))
             for dirname in dirnames:
-                (Path(dirpath) / dirname).chmod(0o755)
+                self._normalize_mirror_directory(Path(dirpath) / dirname)
+
+    @staticmethod
+    def _normalize_mirror_directory(path: Path) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except OSError as e:
+            raise BundleManifestError(f"Could not inspect S3 mirror directory {path}") from e
+        if not stat.S_ISDIR(mode):
+            raise BundleManifestError(f"S3 mirror contains unsafe directory {path}")
+
+        try:
+            directory_fd = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError as e:
+            raise BundleManifestError(
+                f"Could not open S3 mirror directory safely: {path}"
+            ) from e
+        try:
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                raise BundleManifestError(f"S3 mirror contains unsafe directory {path}")
+            os.fchmod(directory_fd, 0o755)
+        except OSError as e:
+            raise BundleManifestError(
+                f"Could not normalize S3 mirror directory permissions: {path}"
+            ) from e
+        finally:
+            os.close(directory_fd)
 
     @contextmanager
     def _translate_s3_error(self, operation: str) -> Iterator[None]:
