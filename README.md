@@ -29,7 +29,7 @@ version in your deployment, and select a published bundle version:
 
 ```bash
 AIRFLOW_VERSION=3.3.0
-AIRFLOW_MANIFEST_BUNDLE_VERSION=0.1.0
+AIRFLOW_MANIFEST_BUNDLE_VERSION=0.2.0
 BUNDLE_WHEEL_URL="https://github.com/ephraimbuddy/airflow-manifest-bundle/releases/download/v${AIRFLOW_MANIFEST_BUNDLE_VERSION}/airflow_manifest_bundle-${AIRFLOW_MANIFEST_BUNDLE_VERSION}-py3-none-any.whl"
 
 python -m pip install \
