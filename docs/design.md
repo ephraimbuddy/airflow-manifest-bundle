@@ -160,8 +160,10 @@ The automatic publisher rejects an empty source tree by default. The
 does not operate for a pinned bundle.
 
 If automatic publication fails and a current release exists, the bundle logs the
-error and uses the current release. If no release exists, initialization returns a
-recoverable bundle error until publication succeeds.
+error and uses the current release. If no release exists, `initialize()` waits for
+the rest of the stability period. It makes one more publication attempt after this
+wait. If the source changes during the wait, this attempt returns a recoverable
+bundle error. Airflow can try again.
 
 All automatic publishers for one bundle must read the same source tree. This source
 tree is authoritative. An operator must not use a different source or a manual

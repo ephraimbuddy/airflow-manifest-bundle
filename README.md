@@ -110,11 +110,13 @@ source tree atomically. A metadata stability check cannot prove that a non-atomi
 has delivered every intended file, so a staging directory plus atomic rename is the
 safest source-delivery pattern.
 
-On the first start, when no release exists, initialization reports a recoverable
-bundle error until the source passes the stability period. After a release exists,
-an unstable, unreadable, empty, or failed publication leaves the current release
-active. Empty sources are rejected by default; set `"allow_empty_source": true` only
-when publishing an empty bundle is intentional.
+When no release exists, such as on the first start, initialization waits for the
+remaining stability period once and logs that normal wait at info level. If the source
+changes during that wait, or if publication fails, initialization reports a
+recoverable bundle error and Airflow retries. After a release exists, an unstable,
+unreadable, empty, or failed publication leaves the current release active. Empty
+sources are rejected by default; set `"allow_empty_source": true` only when publishing
+an empty bundle is intentional.
 
 Automatic publication has these operational requirements:
 
