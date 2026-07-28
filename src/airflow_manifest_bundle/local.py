@@ -71,6 +71,14 @@ class BundleManifestReferenceChangedError(BundleManifestError):
     """Raised when a publisher's expected manifest reference is stale."""
 
 
+class _AutoPublishNotReadyError(BundleManifestError):
+    """Raised when no release is available and the source still needs stability time."""
+
+    def __init__(self, message: str, *, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 @dataclass(frozen=True)
 class LocalBundleManifestRef:
     """Compact pointer to an immutable local bundle manifest."""
@@ -212,7 +220,19 @@ class ManifestLocalDagBundle(BaseDagBundle):
                     with self.lock():
                         self._materialize_cached_version(version=version, manifest_ref=None)
         else:
-            self.refresh()
+            with _oserror_as_manifest_error():
+                try:
+                    self.refresh()
+                except _AutoPublishNotReadyError as e:
+                    log.info(
+                        "No bundle release is available yet; waiting %.3g seconds for source "
+                        "stability. bundle=%s source=%s",
+                        e.retry_after,
+                        self.name,
+                        self.source_path,
+                    )
+                    time.sleep(e.retry_after)
+                    self.refresh()
         super().initialize()
 
     def refresh(self) -> None:
@@ -290,15 +310,16 @@ class ManifestLocalDagBundle(BaseDagBundle):
         ):
             return current_ref
 
-        if (
-            not source_is_confirmed
-            and self.source_stability_seconds > 0
-            and not self._auto_publish_candidate_is_ready(signature)
-        ):
+        if not source_is_confirmed and self.source_stability_seconds > 0:
+            candidate_is_ready, retry_after = self._auto_publish_candidate_readiness(signature)
+        else:
+            candidate_is_ready, retry_after = True, 0.0
+        if not candidate_is_ready:
             if current_ref is None:
-                raise BundleManifestError(
+                raise _AutoPublishNotReadyError(
                     f"Bundle source for '{self.name}' has not remained unchanged for "
-                    f"{self.source_stability_seconds:g} seconds; waiting before the first publication"
+                    f"{self.source_stability_seconds:g} seconds; no release is available yet",
+                    retry_after=retry_after,
                 )
             log.info(
                 "Bundle source changed; waiting until it has remained unchanged for %g seconds. "
@@ -389,10 +410,21 @@ class ManifestLocalDagBundle(BaseDagBundle):
 
     def _auto_publish_candidate_is_ready(self, source_signature: str) -> bool:
         """Record or check shared source readiness under the publication lock."""
+        is_ready, _ = self._auto_publish_candidate_readiness(source_signature)
+        return is_ready
+
+    def _auto_publish_candidate_readiness(self, source_signature: str) -> tuple[bool, float]:
+        """Return source readiness and the bounded time until another check."""
         _ensure_public_dir(self.auto_publish_state_path.parent)
         with self.acquire_publication_lock():
             state = self._synchronize_auto_publish_candidate_locked(source_signature)
-            return self._auto_publish_candidate_elapsed(state, now=time.time())
+            now = time.time()
+            if self._auto_publish_candidate_elapsed(state, now=now):
+                return True, 0.0
+            elapsed = now - state.first_observed_at
+            if elapsed < 0:
+                return False, self.source_stability_seconds
+            return False, max(0.0, self.source_stability_seconds - elapsed)
 
     def _ensure_auto_publish_candidate_matches(self, source_signature: str) -> None:
         """Reset a stale shared candidate before taking the confirmed-source fast path."""

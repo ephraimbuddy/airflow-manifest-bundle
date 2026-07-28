@@ -1436,37 +1436,78 @@ class TestManifestLocalDagBundleAutoPublish:
                 allow_empty_source="false",
             )
 
-    def test_bootstrap_waits_for_elapsed_stability_time(self, tmp_path):
+    def test_bootstrap_waits_for_stability_without_initialization_error(self, tmp_path):
         with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
             bundle, source = self._bundle(tmp_path, stability=30)
             _write_file(source, "dags/example.py", "print('dag')")
 
             with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
-                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
-                    bundle.initialize()
-                assert not bundle.manifest_ref_path.exists()
 
-                clock.return_value = 129
-                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
-                    bundle.initialize()
-                assert not bundle.manifest_ref_path.exists()
+                def finish_stability_wait(seconds):
+                    assert not bundle.manifest_ref_path.exists()
+                    clock.return_value += seconds
 
-                clock.return_value = 130
-                bundle.initialize()
+                with mock.patch.object(
+                    local_bundle_module.time,
+                    "sleep",
+                    side_effect=finish_stability_wait,
+                ) as sleep:
+                    bundle.initialize()
 
             assert bundle.manifest_ref_path.is_file()
+            sleep.assert_called_once_with(30)
+            assert json.loads(bundle.auto_publish_state_path.read_text())["first_observed_at"] == 100
             assert (bundle.path / "dags/example.py").read_text() == "print('dag')"
 
-    def test_fresh_instance_uses_shared_bootstrap_stability_candidate(self, tmp_path):
+    def test_bootstrap_source_change_during_wait_stays_unpublished(self, tmp_path):
         with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
-            first, source = self._bundle(tmp_path, stability=30)
-            _write_file(source, "dags/example.py", "print('dag')")
+            bundle, source = self._bundle(tmp_path, stability=30)
+            source_file = _write_file(source, "dags/example.py", "print('incomplete')")
 
             with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
-                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
-                    first.initialize()
 
-                state_payload = json.loads(first.auto_publish_state_path.read_text())
+                def change_source_during_wait(seconds):
+                    assert not bundle.manifest_ref_path.exists()
+                    source_file.write_text("print('complete')")
+                    clock.return_value += seconds
+
+                with (
+                    mock.patch.object(
+                        local_bundle_module.time,
+                        "sleep",
+                        side_effect=change_source_during_wait,
+                    ),
+                    pytest.raises(BundleManifestError, match="has not remained unchanged"),
+                ):
+                    bundle.initialize()
+
+            assert not bundle.manifest_ref_path.exists()
+            assert json.loads(bundle.auto_publish_state_path.read_text())["first_observed_at"] == 130
+
+    def test_fresh_instance_uses_shared_change_stability_candidate(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            first, source = self._bundle(tmp_path, stability=30)
+            source_file = _write_file(source, "dags/example.py", "print('old')")
+
+            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+
+                def advance_clock(seconds):
+                    clock.return_value += seconds
+
+                with mock.patch.object(
+                    local_bundle_module.time,
+                    "sleep",
+                    side_effect=advance_clock,
+                ):
+                    first.initialize()
+                first_version = _version_string(first.get_current_version())
+
+                source_file.write_text("print('new')")
+                second, _ = self._bundle(tmp_path, stability=30, source=source)
+                clock.return_value = 140
+                second.refresh()
+
+                state_payload = json.loads(second.auto_publish_state_path.read_text())
                 assert set(state_payload) == {
                     "schema_version",
                     "bundle_name",
@@ -1477,18 +1518,19 @@ class TestManifestLocalDagBundleAutoPublish:
                     state_payload["schema_version"]
                     == local_bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION
                 )
-                assert state_payload["bundle_name"] == first.name
+                assert state_payload["bundle_name"] == second.name
                 assert state_payload["source_signature"].startswith("sha256:")
-                assert state_payload["first_observed_at"] == 100
-                assert stat.S_IMODE(first.auto_publish_state_path.stat().st_mode) == 0o644
-                assert stat.S_IMODE(first.auto_publish_state_path.parent.stat().st_mode) == 0o755
+                assert state_payload["first_observed_at"] == 140
+                assert stat.S_IMODE(second.auto_publish_state_path.stat().st_mode) == 0o644
+                assert stat.S_IMODE(second.auto_publish_state_path.parent.stat().st_mode) == 0o755
+                assert _version_string(second.get_current_version()) == first_version
 
-                second, _ = self._bundle(tmp_path, stability=30, source=source)
-                clock.return_value = 130
-                second.initialize()
+                third, _ = self._bundle(tmp_path, stability=30, source=source)
+                clock.return_value = 170
+                third.initialize()
 
-            assert second.manifest_ref_path.is_file()
-            assert (second.path / "dags/example.py").read_text() == "print('dag')"
+            assert _version_string(third.get_current_version()) != first_version
+            assert (third.path / "dags/example.py").read_text() == "print('new')"
 
     def test_different_instance_can_publish_shared_stable_candidate(self, tmp_path):
         source = tmp_path / "source"
@@ -1608,11 +1650,16 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
 
             with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
-                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
-                    bundle.initialize()
 
-                clock.return_value = 130
-                bundle.initialize()
+                def advance_clock(seconds):
+                    clock.return_value += seconds
+
+                with mock.patch.object(
+                    local_bundle_module.time,
+                    "sleep",
+                    side_effect=advance_clock,
+                ):
+                    bundle.initialize()
                 confirmed_version = _version_string(bundle.get_current_version())
 
                 source_link.unlink()
@@ -1648,8 +1695,17 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
 
             with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
-                with pytest.raises(BundleManifestError, match="has not remained unchanged"):
+
+                def advance_clock(seconds):
+                    clock.return_value += seconds
+
+                with mock.patch.object(
+                    local_bundle_module.time,
+                    "sleep",
+                    side_effect=advance_clock,
+                ):
                     bundle.initialize()
+                bundle.refresh()
                 original_state = json.loads(bundle.auto_publish_state_path.read_text())
 
                 source_link.unlink()
@@ -1660,7 +1716,7 @@ class TestManifestLocalDagBundleAutoPublish:
 
                 source_link.unlink()
                 _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
-                clock.return_value = 110
+                clock.return_value = 140
                 with pytest.raises(BundleManifestSourceChangedError, match="candidate was recorded"):
                     bundle._auto_publish_candidate_is_ready(delayed_signature)
 
