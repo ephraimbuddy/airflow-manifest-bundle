@@ -38,7 +38,11 @@ jobs:
       - name: Install the package with Airflow
         run: |
           uv venv --python ${{ matrix.python-version }}
-          uv pip install "apache-airflow==${{ matrix.airflow-version }}" pytest .
+          uv pip install \
+            "apache-airflow==${{ matrix.airflow-version }}" \
+            "apache-airflow-providers-amazon==9.10.0" \
+            pytest \
+            ".[s3]"
       # No PYTHONPATH: the tests run against the installed copy of the package.
       - name: Run tests
         run: .venv/bin/python -m pytest -q

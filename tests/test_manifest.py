@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 
@@ -11,6 +12,7 @@ from airflow_manifest_bundle.manifest import (
     BundleManifestError,
     BundleManifestSourceChangedError,
     build_bundle_version_manifest_result,
+    collect_bundle_source_snapshot,
 )
 
 
@@ -58,6 +60,49 @@ def test_manifest_hash_changes_when_file_content_changes(tmp_path):
     )
 
     assert first_manifest["version"] != second_manifest["version"]
+
+
+def test_manifest_uses_complete_precomputed_file_hashes(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    content = "print('dag')"
+    _write_file(source, "dags/example.py", content)
+    source_snapshot = collect_bundle_source_snapshot(source)
+    expected_digest = hashlib.sha256(content.encode()).hexdigest()
+
+    def fail_hash(_):
+        raise AssertionError("precomputed hashes must skip a second source read")
+
+    monkeypatch.setattr(manifest_module, "compute_file_sha256", fail_hash)
+    result = build_bundle_version_manifest_result(
+        bundle_name="manifest-s3",
+        root=source,
+        backend_type="local",
+        source_snapshot=source_snapshot,
+        precomputed_file_sha256={"dags/example.py": expected_digest},
+    )
+
+    assert result.manifest["files"][0]["sha256"] == expected_digest
+
+
+@pytest.mark.parametrize(
+    "precomputed_hashes",
+    [
+        {},
+        {"other.py": "0" * 64},
+        {"dags/example.py": "not-a-sha256"},
+    ],
+)
+def test_manifest_rejects_invalid_precomputed_file_hashes(tmp_path, precomputed_hashes):
+    source = tmp_path / "source"
+    _write_file(source, "dags/example.py", "print('dag')")
+
+    with pytest.raises(BundleManifestError, match="Precomputed file hash"):
+        build_bundle_version_manifest_result(
+            bundle_name="manifest-s3",
+            root=source,
+            backend_type="local",
+            precomputed_file_sha256=precomputed_hashes,
+        )
 
 
 def test_manifest_hash_changes_when_executable_bit_changes(tmp_path):

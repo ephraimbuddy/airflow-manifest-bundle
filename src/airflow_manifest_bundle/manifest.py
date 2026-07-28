@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from airflow.exceptions import AirflowException
@@ -70,6 +71,14 @@ class BundleSourceSnapshot:
     root: Path
     files: tuple[BundleSourceFile, ...]
     signature: str
+
+
+def is_ignored_bundle_relative_path(relative_path: str) -> bool:
+    """Return whether manifest collection excludes one normalized POSIX path."""
+    path = PurePosixPath(relative_path)
+    if any(part in IGNORED_DIR_NAMES for part in path.parts[:-1]):
+        return True
+    return path.name in IGNORED_FILE_NAMES or path.suffix in IGNORED_FILE_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -290,22 +299,38 @@ def build_bundle_version_manifest_result(
     root: Path,
     backend_type: str,
     source_snapshot: BundleSourceSnapshot | None = None,
+    precomputed_file_sha256: Mapping[str, str] | None = None,
 ) -> BundleVersionManifest:
     """Build a deterministic content manifest for a materialized Dag bundle root."""
     source_snapshot = source_snapshot or collect_bundle_source_snapshot(root)
     root = _validate_bundle_root(root)
     if source_snapshot.root != root:
         raise ValueError("source_snapshot root does not match manifest root")
+    expected_paths = {source_file.relative_path for source_file in source_snapshot.files}
+    if precomputed_file_sha256 is not None and set(precomputed_file_sha256) != expected_paths:
+        raise BundleManifestError(
+            "Precomputed file hashes do not match the bundle source snapshot"
+        )
 
     files: list[dict[str, Any]] = []
     total_size = 0
     for source_file in source_snapshot.files:
-        try:
-            file_digest, _ = compute_file_sha256(source_file.path)
-        except FileNotFoundError as e:
-            raise BundleManifestSourceChangedError(
-                f"Bundle source file disappeared while building manifest: {source_file.relative_path}"
-            ) from e
+        if precomputed_file_sha256 is None:
+            try:
+                file_digest, _ = compute_file_sha256(source_file.path)
+            except FileNotFoundError as e:
+                raise BundleManifestSourceChangedError(
+                    f"Bundle source file disappeared while building manifest: {source_file.relative_path}"
+                ) from e
+        else:
+            file_digest = precomputed_file_sha256[source_file.relative_path]
+            if (
+                len(file_digest) != 64
+                or any(character not in "0123456789abcdef" for character in file_digest)
+            ):
+                raise BundleManifestError(
+                    f"Precomputed file hash is invalid for {source_file.relative_path!r}"
+                )
         _ensure_source_file_unchanged(source_file)
         files.append(
             {

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "airflow-manifest-bundle"
 version = "0.1.0"
-description = "Manifest-backed local Dag bundle for Apache Airflow: immutable, content-addressed Dag snapshots with reproducible pinned execution."
+description = "Manifest-backed Dag bundles for Apache Airflow with immutable, content-addressed snapshots and reproducible pinned execution."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -39,6 +39,7 @@ Issues = "https://github.com/ephraimbuddy/airflow-manifest-bundle/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+s3 = ["apache-airflow-providers-amazon>=9.10.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/airflow_manifest_bundle"]

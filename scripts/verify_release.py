@@ -311,7 +311,11 @@ def build_and_validate(
             [
                 venv_python,
                 "-c",
-                "from airflow_manifest_bundle.local import ManifestLocalDagBundle",
+                (
+                    "from airflow_manifest_bundle import ManifestDagBundleBase; "
+                    "from airflow_manifest_bundle.local import ManifestLocalDagBundle; "
+                    "from airflow_manifest_bundle.s3 import ManifestS3DagBundle"
+                ),
             ]
         )
     return artifacts

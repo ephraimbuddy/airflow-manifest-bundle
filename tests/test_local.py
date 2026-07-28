@@ -10,11 +10,12 @@ from unittest import mock
 import pytest
 from _test_utils import conf_vars
 
-from airflow_manifest_bundle import local as local_bundle_module
+from airflow_manifest_bundle import bundle as bundle_module
+from airflow_manifest_bundle import local as local_module
 from airflow_manifest_bundle import manifest as manifest_module
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
+from airflow_manifest_bundle.bundle import BundleManifestReferenceChangedError
 from airflow_manifest_bundle.local import (
-    BundleManifestReferenceChangedError,
     ManifestLocalDagBundle,
     publish_manifest_local_dag_bundle,
 )
@@ -73,6 +74,25 @@ def _publish_manifest_local_bundle(
     )
     _write_manifest_ref(bundle.manifest_ref_path, result.ref_payload)
     return result
+
+
+def test_local_module_does_not_reexport_common_runtime_names():
+    assert local_module.__all__ == [
+        "ManifestLocalDagBundle",
+        "publish_manifest_local_dag_bundle",
+    ]
+    for name in (
+        "AUTO_PUBLISH_STATE_FILE_NAME",
+        "AUTO_PUBLISH_STATE_SCHEMA_VERSION",
+        "BundleManifestReferenceChangedError",
+        "BundleManifestRef",
+        "BundlePublishResult",
+        "FILESYSTEM_ARTIFACT_BACKEND_TYPE",
+        "LocalBundleManifestRef",
+        "LocalBundlePublishResult",
+        "SHA256_VERSION_PREFIX",
+    ):
+        assert not hasattr(local_module, name)
 
 
 class TestManifestLocalDagBundle:
@@ -338,15 +358,15 @@ class TestManifestLocalDagBundle:
     def test_publish_rejects_file_added_during_publication(self, tmp_path, monkeypatch):
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")
-        real_materialize = local_bundle_module._materialize_local_manifest_snapshot
+        real_materialize = bundle_module._materialize_manifest_snapshot
 
         def materialize_and_add_file(**kwargs):
             real_materialize(**kwargs)
             _write_file(source, "dags/added.py", "print('added')")
 
         monkeypatch.setattr(
-            local_bundle_module,
-            "_materialize_local_manifest_snapshot",
+            bundle_module,
+            "_materialize_manifest_snapshot",
             materialize_and_add_file,
         )
 
@@ -426,7 +446,7 @@ class TestManifestLocalDagBundle:
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")
         calls = []
-        real_write_manifest_ref_atomically = local_bundle_module._write_manifest_ref_atomically
+        real_write_manifest_ref_atomically = bundle_module._write_manifest_ref_atomically
 
         def record_fsync_directory(path):
             calls.append(("fsync_directory", Path(path)))
@@ -435,9 +455,9 @@ class TestManifestLocalDagBundle:
             calls.append(("write_manifest_ref", Path(manifest_ref_path)))
             real_write_manifest_ref_atomically(manifest_ref_path, ref_payload)
 
-        monkeypatch.setattr(local_bundle_module, "_fsync_directory", record_fsync_directory)
+        monkeypatch.setattr(bundle_module, "_fsync_directory", record_fsync_directory)
         monkeypatch.setattr(
-            local_bundle_module,
+            bundle_module,
             "_write_manifest_ref_atomically",
             record_write_manifest_ref_atomically,
         )
@@ -465,7 +485,7 @@ class TestManifestLocalDagBundle:
         def fail_fsync_tree_directories(root):
             raise RuntimeError(f"failed to sync {root}")
 
-        monkeypatch.setattr(local_bundle_module, "_fsync_tree_directories", fail_fsync_tree_directories)
+        monkeypatch.setattr(bundle_module, "_fsync_tree_directories", fail_fsync_tree_directories)
 
         with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
             bundle = ManifestLocalDagBundle(
@@ -491,7 +511,7 @@ class TestManifestLocalDagBundle:
             bundle.published_versions_dir.mkdir(parents=True)
             orphan = bundle.published_versions_dir / f".sha256-{'1' * 64}.abandoned"
             _write_file(orphan, "partial.py", "print('partial')")
-            local_bundle_module._set_snapshot_permissions(orphan)
+            bundle_module._set_snapshot_permissions(orphan)
             unrelated_hidden_dir = bundle.published_versions_dir / ".not-a-publisher-temp"
             unrelated_hidden_dir.mkdir()
 
@@ -673,7 +693,7 @@ class TestManifestLocalDagBundle:
             # The marker skips only the hashing pass; the structural pass still runs so
             # that truncated or mutated cache trees are detected and rebuilt.
             with mock.patch(
-                "airflow_manifest_bundle.local.compute_file_sha256",
+                "airflow_manifest_bundle.bundle.compute_file_sha256",
                 side_effect=AssertionError("marker must skip the hashing pass"),
             ):
                 fresh_bundle.initialize()
@@ -692,9 +712,9 @@ class TestManifestLocalDagBundle:
             cached_version_path = bundle.versions_dir / published.version
             marker_path = bundle._validation_marker_path(published.version)
             calls: list[tuple[str, Path]] = []
-            real_fsync_file = local_bundle_module._fsync_file
-            real_fsync_directory = local_bundle_module._fsync_directory
-            real_replace = local_bundle_module.os.replace
+            real_fsync_file = bundle_module._fsync_file
+            real_fsync_directory = bundle_module._fsync_directory
+            real_replace = bundle_module.os.replace
 
             def record_fsync_file(path):
                 calls.append(("fsync_file", Path(path)))
@@ -710,9 +730,9 @@ class TestManifestLocalDagBundle:
                     calls.append(("replace_cache", destination_path))
                 real_replace(source_path, destination_path)
 
-            monkeypatch.setattr(local_bundle_module, "_fsync_file", record_fsync_file)
-            monkeypatch.setattr(local_bundle_module, "_fsync_directory", record_fsync_directory)
-            monkeypatch.setattr(local_bundle_module.os, "replace", record_replace)
+            monkeypatch.setattr(bundle_module, "_fsync_file", record_fsync_file)
+            monkeypatch.setattr(bundle_module, "_fsync_directory", record_fsync_directory)
+            monkeypatch.setattr(bundle_module.os, "replace", record_replace)
 
             bundle.refresh()
 
@@ -750,7 +770,7 @@ class TestManifestLocalDagBundle:
             _write_file(orphan, "dags/leftover.py", "print('leftover')")
 
             with mock.patch(
-                "airflow_manifest_bundle.local.remove_bundle_tree_forcefully",
+                "airflow_manifest_bundle.bundle.remove_bundle_tree_forcefully",
                 autospec=True,
                 side_effect=PermissionError("operation not permitted"),
             ):
@@ -1156,7 +1176,7 @@ class TestManifestLocalDagBundle:
         def fail_walk(*args, onerror, **kwargs):
             onerror(PermissionError(13, "Permission denied", str(snapshot_root / "unreadable")))
 
-        monkeypatch.setattr(local_bundle_module.os, "walk", fail_walk)
+        monkeypatch.setattr(bundle_module.os, "walk", fail_walk)
 
         with pytest.raises(BundleManifestError, match="changed or became unreadable"):
             list(bundle._iter_snapshot_source_files(snapshot_root))
@@ -1341,7 +1361,7 @@ class TestReviewRegressions:
                     os.chmod(dst, 0o755)
                 return result
 
-            monkeypatch.setattr(local_bundle_module.shutil, "copy2", chmod_after_copy)
+            monkeypatch.setattr(bundle_module.shutil, "copy2", chmod_after_copy)
             with pytest.raises(BundleManifestSourceChangedError, match="source changed"):
                 publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
 
@@ -1441,14 +1461,14 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle, source = self._bundle(tmp_path, stability=30)
             _write_file(source, "dags/example.py", "print('dag')")
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
 
                 def finish_stability_wait(seconds):
                     assert not bundle.manifest_ref_path.exists()
                     clock.return_value += seconds
 
                 with mock.patch.object(
-                    local_bundle_module.time,
+                    bundle_module.time,
                     "sleep",
                     side_effect=finish_stability_wait,
                 ) as sleep:
@@ -1464,7 +1484,7 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle, source = self._bundle(tmp_path, stability=30)
             source_file = _write_file(source, "dags/example.py", "print('incomplete')")
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
 
                 def change_source_during_wait(seconds):
                     assert not bundle.manifest_ref_path.exists()
@@ -1473,7 +1493,7 @@ class TestManifestLocalDagBundleAutoPublish:
 
                 with (
                     mock.patch.object(
-                        local_bundle_module.time,
+                        bundle_module.time,
                         "sleep",
                         side_effect=change_source_during_wait,
                     ),
@@ -1489,13 +1509,13 @@ class TestManifestLocalDagBundleAutoPublish:
             first, source = self._bundle(tmp_path, stability=30)
             source_file = _write_file(source, "dags/example.py", "print('old')")
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
 
                 def advance_clock(seconds):
                     clock.return_value += seconds
 
                 with mock.patch.object(
-                    local_bundle_module.time,
+                    bundle_module.time,
                     "sleep",
                     side_effect=advance_clock,
                 ):
@@ -1511,12 +1531,14 @@ class TestManifestLocalDagBundleAutoPublish:
                 assert set(state_payload) == {
                     "schema_version",
                     "bundle_name",
+                    "source_type",
+                    "source_identity",
                     "source_signature",
                     "first_observed_at",
                 }
                 assert (
                     state_payload["schema_version"]
-                    == local_bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION
+                    == bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION
                 )
                 assert state_payload["bundle_name"] == second.name
                 assert state_payload["source_signature"].startswith("sha256:")
@@ -1545,7 +1567,7 @@ class TestManifestLocalDagBundleAutoPublish:
             first, _ = self._bundle(tmp_path, stability=30, source=source)
             second, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 first.refresh()
                 assert _version_string(first.get_current_version()) == old.version
 
@@ -1567,7 +1589,7 @@ class TestManifestLocalDagBundleAutoPublish:
             _write_file(source, "dags/example.py", "print('new')")
             bundle, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 bundle.initialize()
                 bundle.refresh()
                 assert _version_string(bundle.get_current_version()) == old.version
@@ -1589,7 +1611,7 @@ class TestManifestLocalDagBundleAutoPublish:
             old = publish_manifest_local_dag_bundle(bundle=publisher, source_path=source)
             bundle, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 _write_file(source, "dags/example.py", "print('candidate one')")
                 bundle.refresh()
 
@@ -1620,7 +1642,7 @@ class TestManifestLocalDagBundleAutoPublish:
             second, _ = self._bundle(tmp_path, stability=30, source=source)
             third, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 source_file.write_text("print('candidate one')")
                 first.refresh()
 
@@ -1649,13 +1671,13 @@ class TestManifestLocalDagBundleAutoPublish:
         with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
             bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
 
                 def advance_clock(seconds):
                     clock.return_value += seconds
 
                 with mock.patch.object(
-                    local_bundle_module.time,
+                    bundle_module.time,
                     "sleep",
                     side_effect=advance_clock,
                 ):
@@ -1694,13 +1716,13 @@ class TestManifestLocalDagBundleAutoPublish:
         with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
             bundle, _ = self._bundle(tmp_path, stability=30, source=source_link)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
 
                 def advance_clock(seconds):
                     clock.return_value += seconds
 
                 with mock.patch.object(
-                    local_bundle_module.time,
+                    bundle_module.time,
                     "sleep",
                     side_effect=advance_clock,
                 ):
@@ -1710,15 +1732,13 @@ class TestManifestLocalDagBundleAutoPublish:
 
                 source_link.unlink()
                 _create_symlink_or_skip(source_b, source_link, target_is_directory=True)
-                delayed_signature = local_bundle_module.collect_bundle_source_snapshot(
-                    source_link
-                ).signature
+                delayed_source = bundle._prepare_publish_source()
 
                 source_link.unlink()
                 _create_symlink_or_skip(source_a, source_link, target_is_directory=True)
                 clock.return_value = 140
-                with pytest.raises(BundleManifestSourceChangedError, match="candidate was recorded"):
-                    bundle._auto_publish_candidate_is_ready(delayed_signature)
+                with pytest.raises(BundleManifestSourceChangedError, match="source changed"):
+                    bundle._auto_publish_candidate_is_ready(delayed_source)
 
             assert json.loads(bundle.auto_publish_state_path.read_text()) == original_state
 
@@ -1758,9 +1778,9 @@ class TestManifestLocalDagBundleAutoPublish:
             _write_file(source, "dags/example.py", "print('new')")
 
             with (
-                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.bundle"),
                 mock.patch.object(
-                    local_bundle_module,
+                    bundle_module,
                     "_publish_manifest_result",
                     side_effect=BundleManifestError("publish failed"),
                 ),
@@ -1785,12 +1805,12 @@ class TestManifestLocalDagBundleAutoPublish:
             second, _ = self._bundle(tmp_path, stability=30, source=source)
             third, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 first.refresh()
 
                 clock.return_value = 130
                 with mock.patch.object(
-                    local_bundle_module,
+                    bundle_module,
                     "_publish_manifest_result",
                     side_effect=BundleManifestError("publish failed"),
                 ):
@@ -1815,7 +1835,7 @@ class TestManifestLocalDagBundleAutoPublish:
             source_file.write_text("print('new')")
             first, _ = self._bundle(tmp_path, stability=30, source=source)
             second, _ = self._bundle(tmp_path, stability=30, source=source)
-            build_manifest = local_bundle_module.build_bundle_version_manifest_result
+            build_manifest = bundle_module.build_bundle_version_manifest_result
 
             def build_manifest_then_replace_candidate(**kwargs):
                 result = build_manifest(**kwargs)
@@ -1824,12 +1844,12 @@ class TestManifestLocalDagBundleAutoPublish:
                 second.auto_publish_state_path.write_text(json.dumps(state_payload))
                 return result
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 first.refresh()
 
                 clock.return_value = 130
                 with mock.patch.object(
-                    local_bundle_module,
+                    bundle_module,
                     "build_bundle_version_manifest_result",
                     side_effect=build_manifest_then_replace_candidate,
                 ):
@@ -1854,7 +1874,7 @@ class TestManifestLocalDagBundleAutoPublish:
             first, _ = self._bundle(tmp_path, stability=30, source=source)
             second, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=100) as clock:
+            with mock.patch.object(bundle_module.time, "time", return_value=100) as clock:
                 first.refresh()
                 first.auto_publish_state_path.write_text(state_content)
 
@@ -1880,7 +1900,7 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle.auto_publish_state_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": local_bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION + 1,
+                        "schema_version": bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION + 1,
                         "bundle_name": bundle.name,
                         "source_signature": "sha256:future",
                         "first_observed_at": 100,
@@ -1889,13 +1909,16 @@ class TestManifestLocalDagBundleAutoPublish:
             )
 
             with (
-                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
-                mock.patch.object(local_bundle_module.time, "time", return_value=130),
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.bundle"),
+                mock.patch.object(bundle_module.time, "time", return_value=130),
             ):
                 bundle.refresh()
 
             assert "unsupported schema_version" in caplog.text
-            assert json.loads(bundle.auto_publish_state_path.read_text())["schema_version"] == 2
+            assert (
+                json.loads(bundle.auto_publish_state_path.read_text())["schema_version"]
+                == bundle_module.AUTO_PUBLISH_STATE_SCHEMA_VERSION + 1
+            )
             assert _version_string(bundle.get_current_version()) == old.version
 
     def test_future_shared_timestamp_does_not_publish_early(self, tmp_path, caplog):
@@ -1911,12 +1934,12 @@ class TestManifestLocalDagBundleAutoPublish:
             first, _ = self._bundle(tmp_path, stability=30, source=source)
             second, _ = self._bundle(tmp_path, stability=30, source=source)
 
-            with mock.patch.object(local_bundle_module.time, "time", return_value=200):
+            with mock.patch.object(bundle_module.time, "time", return_value=200):
                 first.refresh()
 
             with (
-                caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"),
-                mock.patch.object(local_bundle_module.time, "time", return_value=130),
+                caplog.at_level("WARNING", logger="airflow_manifest_bundle.bundle"),
+                mock.patch.object(bundle_module.time, "time", return_value=130),
             ):
                 second.refresh()
 
@@ -1931,15 +1954,15 @@ class TestManifestLocalDagBundleAutoPublish:
             bundle.initialize()
             version = _version_string(bundle.get_current_version())
             source_file.write_text("print('candidate')")
-            materialize = local_bundle_module._materialize_local_manifest_snapshot
+            materialize = bundle_module._materialize_manifest_snapshot
 
             def materialize_then_change_source(**kwargs):
                 materialize(**kwargs)
                 source_file.write_text("print('changed again')")
 
             with mock.patch.object(
-                local_bundle_module,
-                "_materialize_local_manifest_snapshot",
+                bundle_module,
+                "_materialize_manifest_snapshot",
                 side_effect=materialize_then_change_source,
             ):
                 bundle.refresh()
@@ -2031,7 +2054,7 @@ class TestManifestLocalDagBundleAutoPublish:
                 source_link,
                 target_is_directory=True,
             )
-            with caplog.at_level("WARNING", logger="airflow_manifest_bundle.local"):
+            with caplog.at_level("WARNING", logger="airflow_manifest_bundle.bundle"):
                 bundle.refresh()
 
             assert "keeping the current release" in caplog.text
