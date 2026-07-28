@@ -1,12 +1,14 @@
 # airflow-manifest-bundle
 
-A manifest-backed local Dag bundle for Apache Airflow — pip-install it, point your
-bundle config at it, and it works with any standard Airflow 3.1+ installation.
+Manifest-backed local and S3 Dag bundles for Apache Airflow — install the package,
+point your bundle config at it, and it works with any standard Airflow 3.1+
+installation.
 
 The Airflow `LocalDagBundle` cannot identify the exact source files a task retry or rerun
 used: files can change after a Dag run is created, so its bundle version resolves nothing.
-`ManifestLocalDagBundle` gives shared-filesystem deployments reproducible pinned execution
-without requiring Git — it works like `GitDagBundle` does for commits:
+`ManifestLocalDagBundle` and `ManifestS3DagBundle` give filesystem and S3 deployments
+reproducible pinned execution without requiring Git. They work like `GitDagBundle`
+does for commits:
 
 - The bundle **publishes** an immutable, content-addressed snapshot automatically
   after the Dag source stays unchanged for a configured interval.
@@ -38,6 +40,16 @@ The explicit Airflow pin prevents package installation from changing the Airflow
 version in your deployment. Install the same bundle wheel in each Airflow environment
 that loads the bundle.
 
+For an S3 source, install the optional Amazon provider dependency:
+
+```bash
+python -m pip install \
+  "apache-airflow==${AIRFLOW_VERSION}" \
+  "airflow-manifest-bundle[s3] @ ${BUNDLE_WHEEL_URL}"
+```
+
+The base package and the local bundle do not import the Amazon provider.
+
 The bundle requires Apache Airflow 3.1 or newer, detected at import time with no
 configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
 3.1/3.2 it returns the plain version string those releases expect.
@@ -61,6 +73,37 @@ dag_bundle_config_list = [
   ]
 ```
 
+For S3, keep the same authoritative local `published_root` and replace only the
+source adapter:
+
+```ini
+[dag_processor]
+dag_bundle_config_list = [
+    {
+      "name": "my_dags",
+      "classpath": "airflow_manifest_bundle.s3.ManifestS3DagBundle",
+      "kwargs": {
+        "bucket_name": "airflow-dags",
+        "prefix": "dags/",
+        "published_root": "/shared/dag-releases",
+        "refresh_interval": 30,
+        "deployment_marker_key": ".ready"
+      }
+    }
+  ]
+```
+
+`aws_conn_id` is optional and defaults to `aws_default`, as it does for Airflow's
+stock `S3DagBundle`. The S3 adapter lists and reads objects. It never writes to S3.
+It mirrors the folder into disposable local staging, but Airflow never parses or
+executes that mirror. See the [S3 operator guide](docs/s3.md) for IAM, deployment
+markers, storage, and recovery.
+
+The S3 adapter rejects more than 10,000 included objects, an object larger than
+100 MiB, or more than 1 GiB in total by default. Configure `max_file_count`,
+`max_file_size_bytes`, and `max_total_size_bytes` when a known Dag source needs
+different bounds.
+
 `dag_bundle_storage_path` is optional. If you do not set it, Airflow uses
 `Path(tempfile.gettempdir()) / "airflow" / "dag_bundles"` (usually
 `/tmp/airflow/dag_bundles`) for its disposable cache. Set it explicitly when you
@@ -76,21 +119,23 @@ The environment-variable equivalents are
 `AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST` and, for the optional cache-path
 override, `AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`.
 
-Keep three locations separate and non-overlapping:
+Keep these locations separate and non-overlapping:
 
-- **the Dag source tree** — mutable, read by the bundle's automatic publisher
+- **the Dag source** — a mutable local tree or S3 folder, read by the automatic publisher
+- **the S3 mirror** — disposable per-host staging used only by the S3 adapter
 - **`published_root`** — the authoritative publication area, a shared filesystem path
   writable by automatic publishers and readable by all Airflow components
 - **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
 
 Airflow always parses and executes the immutable snapshot, never the mutable source
-tree. The `source_path` option makes the unpinned bundle refresh act as the publisher.
-A pinned bundle does not read or publish the source.
+or S3 mirror. `source_path` enables the local publisher. An unpinned S3 bundle always
+has an S3 publication source. A pinned bundle reads neither source and does not
+publish.
 
 ## Automatic publication
 
-When `source_path` is configured, each unpinned bundle process checks source metadata
-during `refresh()`. A changed source must remain unchanged for
+Each unpinned publisher checks source metadata during `refresh()`. A changed source
+must remain unchanged for
 `source_stability_seconds` before the bundle hashes and publishes it. The default
 stability period is `refresh_interval`; set it explicitly when you need a different
 delay:
@@ -106,9 +151,10 @@ delay:
 
 The stability period uses elapsed time, not a count of refresh calls. Set
 `source_stability_seconds` to `0` only when your deployment tool replaces the whole
-source tree atomically. A metadata stability check cannot prove that a non-atomic sync
-has delivered every intended file, so a staging directory plus atomic rename is the
-safest source-delivery pattern.
+source tree atomically. A metadata stability check cannot prove that a non-atomic
+deployment has delivered every intended file. Use a staging directory plus atomic
+rename for local sources. For S3, write `deployment_marker_key` last after all
+objects are present.
 
 When no release exists, such as on the first start, initialization waits for the
 remaining stability period once and logs that normal wait at info level. If the source
@@ -120,25 +166,27 @@ an empty bundle is intentional.
 
 Automatic publication has these operational requirements:
 
-- Each unpinned dag processor that uses `source_path` must be able to read that path
-  and write to the bundle's `refs`, `versions`, `_locks`, and `_state` paths under
-  `published_root`. Workers that load pinned versions need only read `published_root`.
+- Each unpinned dag processor must be able to read its source and write to the bundle's
+  `refs`, `versions`, `_locks`, and `_state` paths under `published_root`. An S3
+  publisher also needs write access to its local mirror. Workers that load pinned
+  versions need only read `published_root`; they need no S3 credentials.
 - All automatic publishers must use the same writer identity, or the administrator
   must grant them write access with ownership or ACLs. Access to `published_root`
   alone is not sufficient when an older publisher owns its existing child directories.
-- All automatic publishers for one bundle must observe the same source tree. The
+- All automatic publishers for one bundle must observe the same source. The
   shared publication lock makes those publishers safe and idempotent.
 - Dag-processor hosts must keep their clocks synchronized. Replicas use one shared
   UTC timestamp to measure the source stability period; a host that sees a timestamp
   in the future waits instead of publishing early.
-- `source_path` is authoritative. Do not mix automatic publication with a different
-  source or with manual reference changes for the same bundle. An automatic publisher
-  can move the release reference back to the version of its source.
+- The configured source is authoritative. Do not mix automatic publication with a
+  different source or with manual reference changes for the same bundle. An automatic
+  publisher can move the release reference back to the version of its source.
 - Pinned task, retry, callback, and rerun bundles never publish. They materialize only
   the exact version Airflow gives them.
 
-In steady state, a refresh walks file metadata but does not read file contents. A
-process hashes the source once after it observes a new stable metadata signature.
+In steady state, a local refresh walks file metadata, and an S3 refresh lists remote
+object metadata. Neither reads file contents. A process hashes the prepared local
+tree once after it observes a new stable metadata signature.
 Replicas share the first-observed signature and timestamp under `published_root`, so
 any replica can complete the stability period. The full-hash confirmation remains a
 process-local optimization: a restarted process hashes the stable source once, but
@@ -235,7 +283,8 @@ what core actually does at runtime:
   newest validated cached version when the just-published release is not materialized
   yet (otherwise the callback would be lost — core deletes callback rows before parsing).
 - **Automatic publication.** `source_path` lets the bundle publish during an unpinned
-  refresh. Pinned bundle instances only materialize the requested version.
+  local refresh. The S3 adapter does the same from its isolated mirror. Pinned bundle
+  instances only materialize the requested version.
 - **Shared automatic-publisher coordination.** Airflow can run successive refreshes
   in different dag-processor replicas, so the stability candidate lives under
   `published_root`, protected by the publication lock. Only the confirmed-source
@@ -256,9 +305,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The test suite covers manifest hashing and determinism, automatic snapshot
-publication, validation, and cache materialization and self-healing. It runs against
-an installed Airflow with no database required.
+The test suite covers manifest hashing and determinism, local and S3 publication,
+S3 mirror safety, validation, and cache materialization and self-healing. It runs
+against an installed Airflow with no database required.
 
 Maintainers currently publish wheels and source distributions through GitHub Releases.
 See the [release process](docs/releasing.md) for the version, tag, build, publication,

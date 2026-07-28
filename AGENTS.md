@@ -4,18 +4,21 @@ Guidance for AI coding agents (and new contributors) working in this repository.
 
 ## What this is
 
-`airflow-manifest-bundle` is a standalone pip package providing `ManifestLocalDagBundle`,
-a Dag bundle for Apache Airflow that serves immutable, content-addressed Dag snapshots
-from a shared filesystem. The bundle version is the SHA-256 content hash of the
-snapshot's manifest, so snapshots are self-certifying. Read `docs/design.md` before
-changing runtime behavior — it defines the terms and the safety argument.
+`airflow-manifest-bundle` is a standalone pip package that provides local and S3
+source adapters for manifest Dag bundles. Both adapters serve immutable,
+content-addressed Dag snapshots from a shared filesystem. The bundle version is the
+SHA-256 content hash of the snapshot's manifest, so snapshots are self-certifying.
+Read `docs/design.md` before changing runtime behavior — it defines the terms and the
+safety argument.
 
 ## Layout
 
 - `src/airflow_manifest_bundle/manifest.py` — content-addressing core: hashing, manifest
   schema, validation. Shared by all (current and future) backends.
-- `src/airflow_manifest_bundle/local.py` — `ManifestLocalDagBundle` plus publication
-  logic for the local/shared-filesystem backend.
+- `src/airflow_manifest_bundle/bundle.py` — common publication, reference, immutable
+  snapshot, cache, and validation lifecycle.
+- `src/airflow_manifest_bundle/local.py` — local source adapter.
+- `src/airflow_manifest_bundle/s3.py` — read-only S3 source and local mirror adapter.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
 - `tests/` — pytest suite; no database, no scheduler, no network required.
@@ -71,7 +74,7 @@ non-editable on purpose — it validates the packaged wheel — so do not "fix" 
    shared under `published_root`; only the confirmed-source hashing hint stays in
    process memory. Airflow's disposable cache stores neither.
 9. **One automatic source is authoritative.** All automatic publishers for one bundle
-   must observe the same source tree. The shared publication lock makes that safe and
+   must observe the same source. The shared publication lock makes that safe and
    idempotent; mixing automatic sources or manual reference changes is unsupported.
 
 ## Conventions
