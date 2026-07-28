@@ -415,7 +415,7 @@ def test_explicit_publisher_rejects_empty_source_by_default(tmp_path, monkeypatc
 
     with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
         bundle = _bundle(tmp_path, auto_publish=False)
-        with pytest.raises(BundleManifestError, match="explicitly publish empty S3 source"):
+        with pytest.raises(BundleManifestError, match="explicitly publish empty source tree"):
             publish_manifest_s3_dag_bundle(bundle=bundle)
 
         client.delete("dags/.git/config")

@@ -139,9 +139,9 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
     :param source_stability_seconds: How long source metadata must remain unchanged
         before automatic publication. Defaults to ``refresh_interval``. Set to zero
         only when the deployment process updates the source atomically.
-    :param allow_empty_source: Permit automatic publication of a source tree with no
-        files. Off by default to prevent a failed or incomplete sync from deleting all
-        Dags from the current release.
+    :param allow_empty_source: Permit publication of a source tree with no files. Off
+        by default to prevent a failed or incomplete sync from deleting all Dags from
+        the current release.
     """
 
     supports_versioning = True
@@ -1375,6 +1375,11 @@ def publish_prepared_manifest_dag_bundle(
         published_root=bundle.published_root,
         versions_dir=bundle.versions_dir,
     )
+    if not prepared_source.source_snapshot.files and not bundle.allow_empty_source:
+        raise BundleManifestError(
+            f"Refusing to explicitly publish empty source tree {source_path} for bundle "
+            f"'{bundle.name}'; set allow_empty_source=True if removing every Dag is intended"
+        )
     _ensure_public_dir(bundle.published_versions_dir)
     _ensure_public_dir(bundle.manifest_ref_path.parent)
     with bundle.acquire_publication_lock():

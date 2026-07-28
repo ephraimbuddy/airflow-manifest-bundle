@@ -763,12 +763,6 @@ def publish_manifest_s3_dag_bundle(
     # publication finishes its final local and remote source confirmation.
     with bundle.lock():
         prepared = bundle._prepare_publish_source()
-        if not prepared.source_snapshot.files and not bundle.allow_empty_source:
-            raise BundleManifestError(
-                f"Refusing to explicitly publish empty S3 source "
-                f"{bundle._publish_source_description} for bundle '{bundle.name}'; "
-                "set allow_empty_source=True if removing every Dag is intended"
-            )
         return publish_prepared_manifest_dag_bundle(
             bundle=bundle,
             prepared_source=prepared,

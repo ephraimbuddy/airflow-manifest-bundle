@@ -232,9 +232,9 @@ The source confirmation stays in process memory. The bundle does not write candi
 state or source confirmation to the cache. The cache is disposable and cannot hold
 publisher correctness state.
 
-The automatic publisher and the explicit S3 publisher reject an empty source tree
-by default. The `allow_empty_source` option permits an empty publication. The
-automatic publisher does not operate for a pinned bundle.
+The automatic publisher and each explicit publisher reject an empty source tree by
+default. The `allow_empty_source` option permits an empty publication. The automatic
+publisher does not operate for a pinned bundle.
 
 If automatic publication fails and a current release exists, the bundle logs the
 error and uses the current release. If no release exists, `initialize()` waits for

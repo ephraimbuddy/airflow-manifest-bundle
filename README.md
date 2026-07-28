@@ -268,7 +268,8 @@ snapshot.
 
 The commands reject automatic bundles. Omit `source_path` for an explicit local
 bundle, and set `auto_publish` to false for an explicit S3 bundle. In explicit S3
-mode, dag-processor refreshes do not access S3.
+mode, dag-processor refreshes do not access S3. Both commands reject an empty source
+by default. Set `allow_empty_source` to true only when an empty release is intended.
 
 ## Deployment behavior
 

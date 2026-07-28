@@ -90,6 +90,16 @@ def publish_manifest_local_dag_bundle(
     expected_current_version: str | None = None,
 ) -> BundlePublishResult:
     """Publish a local source tree as an immutable manifest-backed snapshot."""
+    if bundle.source_path is not None:
+        raise BundleManifestError(
+            f"Bundle '{bundle.name}' has source_path configured for automatic publication. "
+            "Remove source_path before using the explicit local publisher."
+        )
+    if bundle.version:
+        raise BundleManifestError(
+            f"Cannot explicitly publish pinned bundle '{bundle.name}' at version "
+            f"{bundle.version!r}"
+        )
     source_path = Path(source_path)
     return publish_prepared_manifest_dag_bundle(
         bundle=bundle,
