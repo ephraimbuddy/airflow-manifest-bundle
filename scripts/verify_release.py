@@ -293,6 +293,7 @@ def build_and_validate(
     with tempfile.TemporaryDirectory(prefix="airflow-manifest-bundle-release-wheel-") as temp_dir:
         venv_dir = Path(temp_dir) / "venv"
         venv_python = venv_dir / "bin" / "python"
+        console_script = venv_dir / "bin" / "airflow-manifest-bundle"
         run_command(["uv", "venv", "--python", python, venv_dir])
         run_command(
             [
@@ -318,6 +319,8 @@ def build_and_validate(
                 ),
             ]
         )
+        run_command([console_script, "publish-local", "--help"])
+        run_command([console_script, "publish-s3", "--help"])
     return artifacts
 
 

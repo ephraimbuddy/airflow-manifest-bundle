@@ -268,6 +268,62 @@ class TestManifestLocalDagBundle:
             assert not stat.S_IMODE(second.version_path.stat().st_mode) & 0o222
             assert not (bundle.versions_dir / (second.version)).exists()
 
+    def test_explicit_publish_rejects_empty_source_by_default(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+            )
+            with pytest.raises(BundleManifestError, match="explicitly publish empty source tree"):
+                publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+
+            assert not bundle.manifest_ref_path.exists()
+
+            allowed = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                allow_empty_source=True,
+            )
+            published = publish_manifest_local_dag_bundle(
+                bundle=allowed,
+                source_path=source,
+            )
+
+            assert published.file_count == 0
+            assert json.loads(allowed.manifest_ref_path.read_text())["version"] == published.version
+
+    def test_explicit_publish_rejects_automatic_local_bundle(self, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                source_path=str(tmp_path / "automatic-source"),
+            )
+
+            with pytest.raises(BundleManifestError, match="source_path configured"):
+                publish_manifest_local_dag_bundle(
+                    bundle=bundle,
+                    source_path=tmp_path / "explicit-source",
+                )
+
+    def test_explicit_publish_rejects_pinned_local_bundle(self, tmp_path):
+        version = f"sha256-{'a' * 64}"
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="manifest-local",
+                published_root=str(tmp_path / "published"),
+                version=version,
+            )
+
+            with pytest.raises(BundleManifestError, match="Cannot explicitly publish pinned bundle"):
+                publish_manifest_local_dag_bundle(
+                    bundle=bundle,
+                    source_path=tmp_path / "explicit-source",
+                )
+
     def test_publish_creates_world_readable_artifacts(self, tmp_path):
         source = tmp_path / "source"
         _write_file(source, "dags/example.py", "print('dag')")

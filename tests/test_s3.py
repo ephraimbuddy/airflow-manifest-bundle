@@ -10,8 +10,9 @@ from unittest import mock
 import pytest
 from _test_utils import conf_vars
 
-from airflow_manifest_bundle import ManifestDagBundleBase
+from airflow_manifest_bundle import ManifestDagBundleBase, cli
 from airflow_manifest_bundle import s3 as s3_module
+from airflow_manifest_bundle.bundle import BundleManifestReferenceChangedError
 from airflow_manifest_bundle.local import (
     ManifestLocalDagBundle,
     publish_manifest_local_dag_bundle,
@@ -22,7 +23,10 @@ from airflow_manifest_bundle.manifest import (
     BundleManifestNotFoundError,
     BundleManifestSourceChangedError,
 )
-from airflow_manifest_bundle.s3 import ManifestS3DagBundle
+from airflow_manifest_bundle.s3 import (
+    ManifestS3DagBundle,
+    publish_manifest_s3_dag_bundle,
+)
 
 
 class FakeS3ClientError(Exception):
@@ -173,6 +177,7 @@ def test_constructor_matches_oss_defaults_and_constructs_hook_lazily(tmp_path, m
 
     with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
         bundle = _bundle(tmp_path)
+        explicit = _bundle(tmp_path, auto_publish=False)
         custom = _bundle(tmp_path, aws_conn_id="custom")
 
         assert bundle.aws_conn_id == "aws_default"
@@ -181,12 +186,23 @@ def test_constructor_matches_oss_defaults_and_constructs_hook_lazily(tmp_path, m
         assert bundle.max_file_count == s3_module.DEFAULT_MAX_FILE_COUNT
         assert bundle.max_file_size_bytes == s3_module.DEFAULT_MAX_FILE_SIZE_BYTES
         assert bundle.max_total_size_bytes == s3_module.DEFAULT_MAX_TOTAL_SIZE_BYTES
+        assert bundle.auto_publish is True
         assert bundle.s3_dags_dir == bundle.base_dir / "_s3_source"
         assert bundle.s3_dags_dir != bundle.versions_dir
+        assert constructed == []
+        assert explicit.view_url_template() == "https://dag-bucket.s3.amazonaws.com/dags/"
         assert constructed == []
         assert custom.s3_hook is not None
         assert constructed == ["custom"]
         assert custom.view_url_template() == "https://dag-bucket.s3.us-east-2.amazonaws.com/dags/"
+
+
+def test_constructor_rejects_non_boolean_auto_publish(tmp_path):
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(TypeError, match="auto_publish must be a boolean"),
+    ):
+        _bundle(tmp_path, auto_publish=1)
 
 
 @pytest.mark.parametrize(
@@ -232,6 +248,249 @@ def test_first_refresh_downloads_and_publishes_local_artifact(tmp_path, monkeypa
         assert ref["source"]["identity"].startswith("sha256:")
         assert ref["source"]["observation"].startswith("sha256:")
         assert (bundle.published_versions_dir / version / MANIFEST_FILE_NAME).is_file()
+
+
+def test_explicit_mode_refresh_uses_release_without_accessing_s3(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "example.py").write_text("print('dag')")
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        local_bundle = ManifestLocalDagBundle(
+            name="manifest-s3",
+            published_root=str(tmp_path / "published"),
+        )
+        published = publish_manifest_local_dag_bundle(bundle=local_bundle, source_path=source)
+
+        class ForbiddenHook:
+            def __init__(self, **kwargs):
+                raise AssertionError(f"S3 hook must not be constructed: {kwargs}")
+
+        monkeypatch.setattr(s3_module, "S3Hook", ForbiddenHook)
+        explicit = _bundle(tmp_path, auto_publish=False)
+        explicit.refresh()
+
+        assert _version_string(explicit.get_current_version()) == published.version
+        assert (explicit.path / "example.py").read_text() == "print('dag')"
+        assert explicit._s3_hook is None
+        assert not explicit.s3_dags_dir.exists()
+
+
+def test_explicit_publisher_rejects_automatic_mode_before_s3_access(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(s3_module, "S3Hook", None)
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(BundleManifestError, match="auto_publish enabled"),
+    ):
+        publish_manifest_s3_dag_bundle(bundle=_bundle(tmp_path))
+
+
+def test_explicit_publisher_rejects_pinned_bundle_before_s3_access(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(s3_module, "S3Hook", None)
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(BundleManifestError, match="Cannot explicitly publish pinned bundle"),
+    ):
+        publish_manifest_s3_dag_bundle(
+            bundle=_bundle(
+                tmp_path,
+                auto_publish=False,
+                version=f"sha256-{'a' * 64}",
+            )
+        )
+
+
+def test_explicit_publisher_syncs_mirror_and_records_s3_source(
+    tmp_path,
+    monkeypatch,
+):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"print('dag')")
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path, auto_publish=False)
+        with mock.patch.object(bundle, "lock", wraps=bundle.lock) as bundle_lock:
+            published = publish_manifest_s3_dag_bundle(bundle=bundle)
+
+        assert bundle_lock.call_count == 1
+        assert client.downloads == ["dags/example.py"]
+        assert published.version.startswith("sha256-")
+        assert published.ref_payload["source"]["type"] == "s3"
+        assert published.ref_payload["source"]["identity"].startswith("sha256:")
+        assert published.ref_payload["source"]["observation"].startswith("sha256:")
+        assert (published.version_path / "example.py").read_bytes() == b"print('dag')"
+        assert not (bundle.versions_dir / published.version).exists()
+        assert not bundle.auto_publish_state_path.exists()
+
+        repeated = publish_manifest_s3_dag_bundle(bundle=bundle)
+        assert repeated.version == published.version
+        assert repeated.created_snapshot is False
+
+
+def test_explicit_publisher_rejects_stale_expected_version(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"first", etag='"first"')
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path, auto_publish=False)
+        first = publish_manifest_s3_dag_bundle(bundle=bundle)
+        client.put("dags/example.py", b"second", etag='"second"')
+        second = publish_manifest_s3_dag_bundle(
+            bundle=bundle,
+            expected_current_version=first.version,
+        )
+        client.put("dags/example.py", b"third", etag='"third"')
+
+        with pytest.raises(BundleManifestReferenceChangedError, match="manifest reference changed"):
+            publish_manifest_s3_dag_bundle(
+                bundle=bundle,
+                expected_current_version=first.version,
+            )
+
+        assert json.loads(bundle.manifest_ref_path.read_text())["version"] == second.version
+
+
+def test_explicit_publisher_remote_change_does_not_write_reference(
+    tmp_path,
+    monkeypatch,
+):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"candidate", etag='"candidate"')
+    client.mutate_on_list = (
+        3,
+        "dags/example.py",
+        b"changed-again",
+        '"changed-again"',
+    )
+    _install_fake_hook(monkeypatch, client)
+
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(BundleManifestSourceChangedError, match="changed while publishing"),
+    ):
+        publish_manifest_s3_dag_bundle(bundle=_bundle(tmp_path, auto_publish=False))
+
+    assert not (tmp_path / "published/refs/manifest-s3/latest.json").exists()
+
+
+def test_explicit_publisher_enforces_deployment_marker_transition(
+    tmp_path,
+    monkeypatch,
+):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"old", etag='"old"')
+    client.put("dags/.ready", b"release-1", etag='"marker-1"')
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(
+            tmp_path,
+            auto_publish=False,
+            deployment_marker_key=".ready",
+        )
+        first = publish_manifest_s3_dag_bundle(bundle=bundle)
+        client.put("dags/example.py", b"new", etag='"new"')
+
+        with pytest.raises(BundleManifestSourceChangedError, match="without a new deployment marker"):
+            publish_manifest_s3_dag_bundle(bundle=bundle)
+
+        assert json.loads(bundle.manifest_ref_path.read_text())["version"] == first.version
+        client.put("dags/.ready", b"release-2", etag='"marker-2"')
+        second = publish_manifest_s3_dag_bundle(bundle=bundle)
+        assert second.version != first.version
+
+
+def test_explicit_publisher_rejects_empty_source_by_default(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/.git/config", b"ignored")
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path, auto_publish=False)
+        with pytest.raises(BundleManifestError, match="explicitly publish empty source tree"):
+            publish_manifest_s3_dag_bundle(bundle=bundle)
+
+        client.delete("dags/.git/config")
+        allowed = _bundle(
+            tmp_path,
+            auto_publish=False,
+            allow_empty_source=True,
+        )
+        published = publish_manifest_s3_dag_bundle(bundle=allowed)
+        assert published.file_count == 0
+
+
+def test_publish_s3_command(tmp_path, monkeypatch, capsys):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"print('dag')")
+    _install_fake_hook(monkeypatch, client)
+    published_root = tmp_path / "published"
+    config = [
+        {
+            "name": "manifest-s3",
+            "classpath": "airflow_manifest_bundle.s3.ManifestS3DagBundle",
+            "kwargs": {
+                "auto_publish": False,
+                "bucket_name": "dag-bucket",
+                "prefix": "dags/",
+                "published_root": str(published_root),
+            },
+        }
+    ]
+
+    with conf_vars(
+        {
+            ("core", "load_examples"): "False",
+            ("dag_processor", "dag_bundle_config_list"): json.dumps(config),
+            ("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles"),
+        }
+    ):
+        cli.main(["publish-s3", "manifest-s3", "--output", "json"])
+
+    out = capsys.readouterr().out
+    published = json.loads(out[out.index("{") :])
+    assert published["bundle_name"] == "manifest-s3"
+    assert published["version"].startswith("sha256-")
+    assert published["file_count"] == 1
+    assert json.loads((published_root / "refs/manifest-s3/latest.json").read_text())[
+        "source"
+    ]["type"] == "s3"
+
+
+def test_publish_s3_command_rejects_automatic_mode(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"print('dag')")
+    constructed = _install_fake_hook(monkeypatch, client)
+    config = [
+        {
+            "name": "manifest-s3",
+            "classpath": "airflow_manifest_bundle.s3.ManifestS3DagBundle",
+            "kwargs": {
+                "bucket_name": "dag-bucket",
+                "prefix": "dags/",
+                "published_root": str(tmp_path / "published"),
+            },
+        }
+    ]
+
+    with conf_vars(
+        {
+            ("core", "load_examples"): "False",
+            ("dag_processor", "dag_bundle_config_list"): json.dumps(config),
+            ("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles"),
+        }
+    ), pytest.raises(SystemExit, match="auto_publish enabled"):
+        cli.main(["publish-s3", "manifest-s3"])
+
+    assert constructed == []
 
 
 def test_prefix_without_trailing_slash_excludes_sibling_prefixes(tmp_path, monkeypatch):

@@ -22,9 +22,9 @@ one solution, but not all deployments can use Git.
 
 The package divides "a change to a file" from "a deployment". A source adapter
 prepares one local source tree. A common publisher writes an immutable snapshot of
-the Dag files. The bundle runs the publisher as part of each refresh. Airflow reads
-only published snapshots. A change to a source file has no effect until a
-publication.
+the Dag files. The bundle can run the publisher as part of each refresh. An operator
+can also run a local or S3 publisher command. Airflow reads only published
+snapshots. A change to a source file has no effect until a publication.
 
 The version of each snapshot is a hash of its content. Airflow keeps this version
 with each Dag run. When a task runs again, the bundle finds the same snapshot from
@@ -56,12 +56,13 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has five modules:
+The package has six modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
 - `bundle.py` — contains `ManifestDagBundleBase` and the common artifact lifecycle.
 - `local.py` — contains the local source adapter, `ManifestLocalDagBundle`.
 - `s3.py` — contains the S3 source adapter, `ManifestS3DagBundle`.
+- `cli.py` — contains the explicit publisher commands.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
 
@@ -111,10 +112,11 @@ Each source adapter ignores these items: `.git`, `__pycache__`, files with the
 
 ## 8. The publication procedure
 
-After the source stability check, a source adapter returns a prepared source. The
-common publisher makes the manifest from this local tree. The publisher then gets
-the publication lock. Other publishers wait for the publication lock. The publisher
-reads the release reference again. It then does these steps:
+A source adapter returns a prepared source. Automatic publication first completes
+the source stability check. The explicit publisher commands do not do this check.
+The common publisher makes the manifest from the prepared local tree. The publisher
+then gets the publication lock. Other publishers wait for the publication lock. The
+publisher reads the release reference again. It then does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
    snapshot does not exist, it copies each file into a temporary folder, checks each
@@ -136,10 +138,40 @@ These properties follow from the procedure:
 
 The publisher does not use the Airflow metadata database.
 
+### 8.1 Explicit publication
+
+A local bundle can omit `source_path`. An operator can then run this command:
+
+```text
+airflow-manifest-bundle publish-local <bundle-name> <source-path>
+```
+
+An S3 bundle can set `auto_publish` to `false`. An operator can then run this command:
+
+```text
+airflow-manifest-bundle publish-s3 <bundle-name>
+```
+
+Each command reads the Airflow bundle configuration. The local command publishes
+the specified source tree. The S3 command reads the configured bucket and prefix.
+It writes a disposable mirror in the Airflow bundle cache. It holds the Airflow
+bundle lock until the final source confirmation is complete.
+
+The explicit command is the deployment boundary. It does not use candidate state or
+the source stability period. The deployment tool must complete the source delivery
+before it runs the command. An S3 deployment marker gives a stronger boundary.
+
+The `--expected-current-version` option stops an old deployment from replacing a
+newer release. Each command can write its result as text or JSON. Each command
+rejects a bundle that has automatic publication enabled.
+
+An explicit S3 publisher needs read access to S3. It does not need S3 write access.
+
 ## 9. Automatic publication
 
-A local `source_path` or an S3 folder enables automatic publication. An unpinned
-refresh does these steps:
+A local `source_path` enables automatic local publication. The default S3
+configuration enables automatic S3 publication. An S3 bundle can set `auto_publish`
+to `false` to disable it. An unpinned automatic refresh does these steps:
 
 1. It reads the current release reference.
 2. It asks the source adapter for a prepared source and a source signature.
@@ -200,9 +232,9 @@ The source confirmation stays in process memory. The bundle does not write candi
 state or source confirmation to the cache. The cache is disposable and cannot hold
 publisher correctness state.
 
-The automatic publisher rejects an empty source tree by default. The
-`allow_empty_source` option permits an empty publication. The automatic publisher
-does not operate for a pinned bundle.
+The automatic publisher and each explicit publisher reject an empty source tree by
+default. The `allow_empty_source` option permits an empty publication. The automatic
+publisher does not operate for a pinned bundle.
 
 If automatic publication fails and a current release exists, the bundle logs the
 error and uses the current release. If no release exists, `initialize()` waits for
@@ -234,11 +266,11 @@ candidate timestamp that is in the future, it waits and writes a warning.
 ### 10.1 Refresh
 
 The Dag processor calls `refresh()` on an interval. The bundle reads the release
-reference. If the bundle has a publication source, it first runs the automatic
-publication procedure. The S3 adapter prepares its mirror under the Airflow bundle
-lock. If a validated cache copy of the current version exists, the bundle uses it
-without a lock. If the cache copy does not exist, the bundle makes one under the
-bundle lock.
+reference. If the bundle has an automatic publication source, it first runs the
+automatic publication procedure. The automatic S3 adapter prepares its mirror under
+the Airflow bundle lock. An explicit S3 bundle does not read S3 during refresh. If a
+validated cache copy of the current version exists, the bundle uses it without a
+lock. If the cache copy does not exist, the bundle makes one under the bundle lock.
 
 ### 10.2 Creation of a cache copy
 
@@ -327,9 +359,10 @@ to each publisher. This permission must apply to all child folders that an earli
 publisher created in the published root. A pinned bundle needs only read access to
 the published root.
 
-An S3 publisher also needs write access to its local mirror. It needs `s3:ListBucket`
-and `s3:GetObject` for the source prefix. It does not need S3 write access. A pinned
-S3 bundle needs no S3 permission.
+An explicit publisher must have write access to its bundle folders in the published
+root. An S3 publisher also needs write access to its local mirror. It needs
+`s3:ListBucket` and `s3:GetObject` for the source prefix. It does not need S3 write
+access. An explicit-mode Dag processor and a pinned S3 bundle need no S3 permission.
 
 ## 13. Compatibility
 
@@ -362,8 +395,8 @@ versions. An incompatible change to a file format must use a new schema version.
   runs, deferred tasks, and callbacks point to versions.
 - An automatic refresh reads the metadata of each source file. A new process also
   waits for the stability period and hashes the unchanged source one time.
-- An S3 refresh reads the remote object inventory. A mirror change needs a second
-  inventory and object downloads.
+- An automatic S3 refresh reads the remote object inventory. An explicit S3 command
+  does the same. A mirror change needs a second inventory and object downloads.
 - The stability period cannot prove that a source delivery is complete. Atomic source
   replacement gives stronger local protection. An S3 deployment marker gives a
   stronger S3 boundary.

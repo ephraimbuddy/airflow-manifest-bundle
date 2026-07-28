@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
@@ -20,6 +20,7 @@ from airflow_manifest_bundle.bundle import (
     ManifestDagBundleBase,
     PreparedPublishSource,
     _write_json_atomically,
+    publish_prepared_manifest_dag_bundle,
 )
 from airflow_manifest_bundle.manifest import (
     BundleManifestError,
@@ -30,6 +31,9 @@ from airflow_manifest_bundle.manifest import (
     compute_file_sha256,
     is_ignored_bundle_relative_path,
 )
+
+if TYPE_CHECKING:
+    from airflow_manifest_bundle.bundle import BundlePublishResult
 
 try:
     from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
@@ -91,6 +95,8 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
     :param max_file_count: Maximum number of included objects in one source observation.
     :param max_file_size_bytes: Maximum size of one included object.
     :param max_total_size_bytes: Maximum total size of all included objects.
+    :param auto_publish: Publish source changes during unpinned refreshes. Disable this
+        option when the standalone publisher command controls releases.
     """
 
     def __init__(
@@ -103,6 +109,7 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         max_file_count: int = DEFAULT_MAX_FILE_COUNT,
         max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
         max_total_size_bytes: int = DEFAULT_MAX_TOTAL_SIZE_BYTES,
+        auto_publish: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -119,6 +126,8 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         _validate_positive_limit("max_file_count", max_file_count)
         _validate_positive_limit("max_file_size_bytes", max_file_size_bytes)
         _validate_positive_limit("max_total_size_bytes", max_total_size_bytes)
+        if not isinstance(auto_publish, bool):
+            raise TypeError("auto_publish must be a boolean")
 
         self.aws_conn_id = aws_conn_id
         self.bucket_name = bucket_name
@@ -127,6 +136,7 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         self.max_file_count = max_file_count
         self.max_file_size_bytes = max_file_size_bytes
         self.max_total_size_bytes = max_total_size_bytes
+        self.auto_publish = auto_publish
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_object_key = (
             _join_s3_key(self._normalized_prefix, deployment_marker_key)
@@ -140,7 +150,7 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
 
     @property
     def _has_publish_source(self) -> bool:
-        return True
+        return self.auto_publish
 
     @property
     def _publish_source_description(self) -> str:
@@ -182,10 +192,12 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         if self._view_url_template:
             return self._view_url_template
         url = f"https://{self.bucket_name}.s3"
-        try:
-            region_name = self.s3_hook.region_name
-        except Exception:  # noqa: BLE001 - the optional UI URL must not block bundle use
-            region_name = None
+        region_name = None
+        if self.auto_publish:
+            try:
+                region_name = self.s3_hook.region_name
+            except Exception:  # noqa: BLE001 - the optional UI URL must not block bundle use
+                region_name = None
         if region_name:
             url += f".{region_name}"
         url += ".amazonaws.com"
@@ -300,10 +312,14 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
                 f"Could not access S3 bucket {self.bucket_name!r}"
             ) from e
         with self._translate_s3_error("validate source"):
-            if self.prefix and not self.s3_hook.check_for_prefix(
-                bucket_name=self.bucket_name,
-                prefix=self.prefix,
-                delimiter="/",
+            if (
+                self.prefix
+                and not self.allow_empty_source
+                and not self.s3_hook.check_for_prefix(
+                    bucket_name=self.bucket_name,
+                    prefix=self.prefix,
+                    delimiter="/",
+                )
             ):
                 raise BundleManifestNotFoundError(
                     f"S3 prefix {self._publish_source_description!r} does not exist"
@@ -726,6 +742,34 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
             ) from e
 
 
+def publish_manifest_s3_dag_bundle(
+    *,
+    bundle: ManifestS3DagBundle,
+    expected_current_version: str | None = None,
+) -> BundlePublishResult:
+    """Publish the configured S3 source as an immutable manifest-backed snapshot."""
+    if bundle.auto_publish:
+        raise BundleManifestError(
+            f"Bundle '{bundle.name}' has auto_publish enabled. Set auto_publish=False "
+            "before using the explicit S3 publisher."
+        )
+    if bundle.version:
+        raise BundleManifestError(
+            f"Cannot explicitly publish pinned bundle '{bundle.name}' at version "
+            f"{bundle.version!r}"
+        )
+
+    # The mirror is mutable host-local staging. Keep the Airflow bundle lock until
+    # publication finishes its final local and remote source confirmation.
+    with bundle.lock():
+        prepared = bundle._prepare_publish_source()
+        return publish_prepared_manifest_dag_bundle(
+            bundle=bundle,
+            prepared_source=prepared,
+            expected_current_version=expected_current_version,
+        )
+
+
 def _validate_marker_relative_key(key: str) -> None:
     if key.startswith("/") or key.endswith("/") or "\\" in key:
         raise TypeError("deployment_marker_key must be a safe relative S3 object key")
@@ -872,4 +916,5 @@ __all__ = [
     "ManifestS3DagBundle",
     "S3ObjectObservation",
     "S3SourceObservation",
+    "publish_manifest_s3_dag_bundle",
 ]
