@@ -74,9 +74,11 @@ non-editable on purpose — it validates the packaged wheel — so do not "fix" 
    disrupt an existing release. Pinned bundles never publish. Candidate readiness is
    shared under `published_root`; only the confirmed-source hashing hint stays in
    process memory. Airflow's disposable cache stores neither.
-9. **One automatic source is authoritative.** All automatic publishers for one bundle
-   must observe the same source. The shared publication lock makes that safe and
-   idempotent; mixing automatic sources or manual reference changes is unsupported.
+9. **One publication mode and one source are authoritative.** All automatic publishers
+   for one bundle must observe the same source. Explicit publisher commands reject
+   bundles with automatic publication enabled. The shared publication lock makes
+   publishers safe and idempotent; mixing sources or manual reference changes is
+   unsupported.
 
 ## Conventions
 

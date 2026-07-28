@@ -320,6 +320,7 @@ def build_and_validate(
             ]
         )
         run_command([console_script, "publish-local", "--help"])
+        run_command([console_script, "publish-s3", "--help"])
     return artifacts
 
 

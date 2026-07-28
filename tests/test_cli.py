@@ -73,6 +73,22 @@ def test_publish_local_command_parses_expected_current_version():
     assert args.expected_current_version == expected_version
 
 
+def test_publish_s3_command_parses_expected_current_version():
+    expected_version = f"sha256-{'b' * 64}"
+
+    args = cli.build_parser().parse_args(
+        [
+            "publish-s3",
+            "manifest-s3",
+            "--expected-current-version",
+            expected_version,
+        ]
+    )
+
+    assert args.bundle_name == "manifest-s3"
+    assert args.expected_current_version == expected_version
+
+
 def test_publish_local_command_rejects_non_manifest_bundle(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -91,6 +107,25 @@ def test_publish_local_command_rejects_non_manifest_bundle(tmp_path):
         }
     ), pytest.raises(SystemExit, match="not configured as a ManifestLocalDagBundle"):
         cli.main(["publish-local", "local", str(source)])
+
+
+def test_publish_s3_command_rejects_non_s3_bundle(tmp_path):
+    config = [
+        {
+            "name": "manifest-local",
+            "classpath": "airflow_manifest_bundle.local.ManifestLocalDagBundle",
+            "kwargs": {"published_root": str(tmp_path / "published")},
+        }
+    ]
+
+    with conf_vars(
+        {
+            ("core", "load_examples"): "False",
+            ("dag_processor", "dag_bundle_config_list"): json.dumps(config),
+            ("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles"),
+        }
+    ), pytest.raises(SystemExit, match="not configured as a ManifestS3DagBundle"):
+        cli.main(["publish-s3", "manifest-local"])
 
 
 def test_publish_local_command_rejects_automatic_local_bundle(tmp_path):

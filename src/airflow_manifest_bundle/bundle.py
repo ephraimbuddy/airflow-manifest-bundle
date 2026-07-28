@@ -897,8 +897,8 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             self.manifest_ref_path,
             missing_message=(
                 f"Bundle '{self.name}' manifest reference file {self.manifest_ref_path} is missing. "
-                "Configure an automatic publication source or restore the release reference "
-                "before refreshing this bundle."
+                "Configure an automatic publication source, run the explicit publisher, or "
+                "restore the release reference before refreshing this bundle."
             ),
             invalid_message=f"Bundle manifest reference is not valid JSON: {self.manifest_ref_path}",
         )
