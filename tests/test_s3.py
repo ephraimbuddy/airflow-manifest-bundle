@@ -25,6 +25,16 @@ from airflow_manifest_bundle.manifest import (
 from airflow_manifest_bundle.s3 import ManifestS3DagBundle
 
 
+class FakeS3ClientError(Exception):
+    def __init__(self, code: str, operation: str) -> None:
+        super().__init__(f"{operation}: {code}")
+        self.response = {"Error": {"Code": code, "Message": code}}
+
+
+def _s3_client_error(code: str, operation: str) -> FakeS3ClientError:
+    return FakeS3ClientError(code, operation)
+
+
 class FakeS3Client:
     def __init__(self, *, endpoint_url: str = "https://s3.example.test") -> None:
         self.meta = SimpleNamespace(endpoint_url=endpoint_url)
@@ -55,8 +65,8 @@ class FakeS3Client:
         assert Bucket == "dag-bucket"
         try:
             data = self.objects[Key]
-        except KeyError as e:
-            raise FileNotFoundError(Key) from e
+        except KeyError:
+            raise _s3_client_error("NoSuchKey", "HeadObject") from None
         return {
             "ContentLength": len(data["body"]),
             "ETag": data["etag"],
@@ -68,7 +78,7 @@ class FakeS3Client:
         if self.bucket_error is not None:
             raise self.bucket_error
         if not self.bucket_exists:
-            raise FileNotFoundError(Bucket)
+            raise _s3_client_error("NoSuchBucket", "HeadBucket")
         return {}
 
     def paginate(self, *, Bucket: str, Prefix: str):
@@ -128,10 +138,11 @@ def _install_fake_hook(monkeypatch, client: FakeS3Client, *, bucket_exists: bool
 
 
 def _bundle(tmp_path: Path, **kwargs) -> ManifestS3DagBundle:
+    prefix = kwargs.pop("prefix", "dags/")
     return ManifestS3DagBundle(
         name="manifest-s3",
         bucket_name="dag-bucket",
-        prefix="dags/",
+        prefix=prefix,
         published_root=str(tmp_path / "published"),
         source_stability_seconds=0,
         **kwargs,
@@ -221,6 +232,21 @@ def test_first_refresh_downloads_and_publishes_local_artifact(tmp_path, monkeypa
         assert ref["source"]["identity"].startswith("sha256:")
         assert ref["source"]["observation"].startswith("sha256:")
         assert (bundle.published_versions_dir / version / MANIFEST_FILE_NAME).is_file()
+
+
+def test_prefix_without_trailing_slash_excludes_sibling_prefixes(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"print('dag')")
+    client.put("dags-archive/old.py", b"print('old')")
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path, prefix="dags")
+        bundle.refresh()
+
+        assert client.downloads == ["dags/example.py"]
+        assert (bundle.path / "example.py").is_file()
+        assert not (bundle.path / "old.py").exists()
 
 
 def test_publish_boundary_acquires_bundle_lock_once(tmp_path, monkeypatch):
@@ -320,6 +346,25 @@ def test_changed_same_size_object_and_deleted_object_repair_mirror(tmp_path, mon
         assert (bundle.s3_dags_dir / "example.py").read_bytes() == b"new"
         assert not (bundle.s3_dags_dir / "deleted.py").exists()
         assert _version_string(bundle.get_current_version()) != first_version
+
+
+def test_sync_normalizes_mirror_before_removing_stale_file(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/old/example.py", b"old")
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path)
+        bundle.refresh()
+        client.delete("dags/old/example.py")
+        client.put("dags/new.py", b"new")
+        stale_directory = bundle.s3_dags_dir / "old"
+        stale_directory.chmod(0o555)
+
+        bundle.refresh()
+
+        assert not stale_directory.exists()
+        assert (bundle.s3_dags_dir / "new.py").read_bytes() == b"new"
 
 
 def test_corrupt_mirror_and_malformed_state_force_repair(tmp_path, monkeypatch):
@@ -553,13 +598,31 @@ def test_missing_bucket_is_a_recoverable_not_found_error(tmp_path, monkeypatch):
 
 
 def test_access_denied_is_not_reported_as_a_missing_bucket(tmp_path, monkeypatch):
-    class AccessDeniedError(Exception):
-        def __init__(self, message: str) -> None:
-            super().__init__(message)
-            self.response = {"Error": {"Code": "403"}}
-
     client = FakeS3Client()
-    client.bucket_error = AccessDeniedError("denied")
+    client.bucket_error = _s3_client_error("403", "HeadBucket")
+    _install_fake_hook(monkeypatch, client)
+
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(BundleManifestError, match="Could not access"),
+    ):
+        _bundle(tmp_path).refresh()
+
+
+@pytest.mark.parametrize(
+    "bucket_error",
+    [
+        FileNotFoundError("unexpected client bug"),
+        KeyError("unexpected client bug"),
+    ],
+)
+def test_plain_python_errors_are_not_reported_as_a_missing_bucket(
+    tmp_path,
+    monkeypatch,
+    bucket_error,
+):
+    client = FakeS3Client()
+    client.bucket_error = bucket_error
     _install_fake_hook(monkeypatch, client)
 
     with (
@@ -636,6 +699,8 @@ def test_pinned_initialization_does_not_construct_s3_hook_or_read_latest(tmp_pat
 
         monkeypatch.setattr(s3_module, "S3Hook", ForbiddenHook)
         pinned = _bundle(tmp_path, version=published.version)
+        assert pinned.view_url() is None
+        assert pinned.view_url_template() is None
         pinned.initialize()
 
         assert (pinned.path / "example.py").read_text() == "print('dag')"

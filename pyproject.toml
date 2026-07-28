@@ -44,10 +44,6 @@ s3 = ["apache-airflow-providers-amazon>=9.10.0"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/airflow_manifest_bundle"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"docs/design.md" = "airflow_manifest_bundle/docs/design.md"
-"docs/s3.md" = "airflow_manifest_bundle/docs/s3.md"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

@@ -172,11 +172,13 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
 
     def view_url(self, version: str | None = None) -> str | None:
         """Return the mutable S3 source URL for Airflow releases that use this method."""
+        if version is not None:
+            return None
         return self.view_url_template()
 
     def view_url_template(self) -> str | None:
         if self.version:
-            raise BundleManifestError("An S3 source URL does not identify a pinned bundle version")
+            return None
         if self._view_url_template:
             return self._view_url_template
         url = f"https://{self.bucket_name}.s3"
@@ -328,7 +330,13 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         marker_before = self._read_deployment_marker(client)
         with self._translate_s3_error("list source"):
             paginator = client.get_paginator("list_objects_v2")
-            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
+            listing_prefix = (
+                f"{self._normalized_prefix}/" if self._normalized_prefix else ""
+            )
+            pages = paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=listing_prefix,
+            )
             for page in pages:
                 contents = page.get("Contents", [])
                 if not isinstance(contents, list):
@@ -482,11 +490,11 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         )
         expected_paths = {entry.relative_path for entry in observation.entries}
         observed_paths = self._observed_mirror_files()
+        self._normalize_mirror_directories()
         for stale_path in sorted(observed_paths - expected_paths, reverse=True):
             (self.s3_dags_dir / stale_path).unlink()
             mirror_changed = True
         self._remove_empty_mirror_directories()
-        self._normalize_mirror_directories()
 
         local_records: list[dict[str, Any]] = []
         file_sha256_by_path: dict[str, str] = {}
@@ -849,7 +857,7 @@ def _sha256_json(payload: dict[str, Any]) -> str:
 def _is_missing_s3_object_error(error: Exception) -> bool:
     response = getattr(error, "response", None)
     if not isinstance(response, dict):
-        return isinstance(error, (FileNotFoundError, KeyError))
+        return False
     error_data = response.get("Error")
     if not isinstance(error_data, dict):
         return False
