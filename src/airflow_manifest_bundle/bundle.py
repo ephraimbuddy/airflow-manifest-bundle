@@ -11,6 +11,7 @@ import stat
 import tempfile
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from fcntl import LOCK_EX, LOCK_UN, flock
@@ -42,6 +43,7 @@ from airflow_manifest_bundle.manifest import (
     serialize_bundle_version_manifest,
     verify_bundle_version_manifest,
 )
+from airflow_manifest_bundle.store import ArtifactStore
 
 log = logging.getLogger(__name__)
 
@@ -165,19 +167,10 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             # callbacks with a misleading log. TypeError matches how any bundle class fails
             # on a bad config kwarg.
             raise TypeError("published_root must be provided")
-        self.published_root = Path(published_root)
-        self.manifest_ref_path = self.published_root / "refs" / self.name / "latest.json"
-
-        if _paths_overlap(self.published_root, get_bundle_storage_root_path()):
-            raise ValueError(
-                "published_root must not overlap Airflow's bundle cache. Configure separate "
-                "authoritative publication and dag_bundle_storage_path locations."
-            )
-
-        self.published_versions_dir = self.published_root / "versions" / self.name
-        self.publication_lock_path = self.published_root / "_locks" / f"{self.name}.lock"
-        self.auto_publish_state_path = (
-            self.published_root / "_state" / self.name / AUTO_PUBLISH_STATE_FILE_NAME
+        self._store: ArtifactStore = FilesystemArtifactStore(
+            bundle_name=self.name,
+            published_root=Path(published_root),
+            cache_root=get_bundle_storage_root_path(),
         )
         if source_stability_seconds is None:
             source_stability_seconds = float(self.refresh_interval)
@@ -198,6 +191,29 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         # dag-processor replicas. The disposable Airflow cache stores neither.
         self._confirmed_source_key: tuple[str, str, str] | None = None
         self._confirmed_source_version: str | None = None
+
+    # The published-artifact layout is owned by the store; these accessors keep the
+    # public attribute surface (used by adapters, the CLI, and operators inspecting
+    # a deployment) stable across the extraction of ``ArtifactStore``.
+    @property
+    def published_root(self) -> Path:
+        return self._store.root
+
+    @property
+    def manifest_ref_path(self) -> Path:
+        return self._store.ref_path
+
+    @property
+    def published_versions_dir(self) -> Path:
+        return self._store.snapshots_root
+
+    @property
+    def auto_publish_state_path(self) -> Path:
+        return self._store.state_path
+
+    @property
+    def publication_lock_path(self) -> Path:
+        return self._store.lock_path
 
     @property
     @abstractmethod
@@ -406,8 +422,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             return current_ref
 
         self._validate_publish_source_paths(prepared.root)
-        _ensure_public_dir(self.published_versions_dir)
-        _ensure_public_dir(self.manifest_ref_path.parent)
+        self._store.prepare_publish_areas()
         with self.acquire_publication_lock():
             self._validate_publish_source_paths(prepared.root)
             if (
@@ -455,11 +470,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     def _validate_publish_source_paths(self, source_path: Path) -> None:
         try:
-            _validate_publish_paths(
-                source_path=source_path,
-                published_root=self.published_root,
-                versions_dir=self.versions_dir,
-            )
+            self._store.validate_source_paths(source_path, cache_versions_dir=self.versions_dir)
         except ValueError as e:
             raise BundleManifestError(str(e)) from e
 
@@ -472,7 +483,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         self._confirmed_source_version = version
 
     def _published_snapshot_exists(self, version: str) -> bool:
-        return (self.published_versions_dir / version).is_dir()
+        return self._store.snapshot_exists(version)
 
     @staticmethod
     def _candidate_matches(
@@ -495,7 +506,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         prepared: PreparedPublishSource,
     ) -> tuple[bool, float]:
         """Return source readiness and the bounded time until another check."""
-        _ensure_public_dir(self.auto_publish_state_path.parent)
+        self._store.prepare_state_area()
         with self.acquire_publication_lock():
             state = self._synchronize_auto_publish_candidate_locked(prepared)
             now = time.time()
@@ -511,7 +522,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         state = self._read_auto_publish_candidate_state_or_none()
         if state is not None and self._candidate_matches(state, prepared):
             return
-        _ensure_public_dir(self.auto_publish_state_path.parent)
+        self._store.prepare_state_area()
         with self.acquire_publication_lock():
             self._synchronize_auto_publish_candidate_locked(prepared)
 
@@ -581,8 +592,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     def _read_auto_publish_candidate_state_or_none(self) -> _AutoPublishCandidateState | None:
         try:
-            payload = self._read_json_file(
-                self.auto_publish_state_path,
+            payload = self._store.read_state(
                 missing_message=f"Automatic-publish state is missing: {self.auto_publish_state_path}",
                 invalid_message=f"Automatic-publish state is not valid JSON: {self.auto_publish_state_path}",
             )
@@ -663,9 +673,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         )
 
     def _write_auto_publish_candidate_state(self, state: _AutoPublishCandidateState) -> None:
-        _remove_orphaned_atomic_temp_files(self.auto_publish_state_path)
-        _write_json_atomically(
-            self.auto_publish_state_path,
+        self._store.write_state(
             {
                 "schema_version": AUTO_PUBLISH_STATE_SCHEMA_VERSION,
                 "bundle_name": self.name,
@@ -735,30 +743,9 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         _fsync_directory(marker_path.parent)
         self._validated_version_paths.add(cache_key)
 
-    @contextmanager
     def acquire_publication_lock(self):
-        """Serialize publishers through a lock stored with the authoritative snapshots."""
-        _ensure_public_dir(self.publication_lock_path.parent)
-        # flock works on a read-only descriptor, so publishers running as different OS
-        # users can all acquire the lock created by whichever user published first.
-        try:
-            fd = os.open(self.publication_lock_path, os.O_CREAT | os.O_RDONLY, 0o644)
-        except PermissionError as e:
-            raise BundleManifestError(
-                f"Cannot open publication lock {self.publication_lock_path}: another OS user "
-                "created it with restrictive permissions. Make it world-readable (chmod 0644) "
-                "and retry."
-            ) from e
-        with os.fdopen(fd, "r") as lock_file:
-            # os.open masks the mode with the umask; repair it whenever this publisher
-            # owns the file so a crash cannot leave it unreadable for other publishers.
-            with suppress(OSError):
-                os.fchmod(fd, 0o644)
-            flock(lock_file, LOCK_EX)
-            try:
-                yield
-            finally:
-                flock(lock_file, LOCK_UN)
+        """Serialize publishers through the artifact store's publication guard."""
+        return self._store.publication_guard()
 
     def _materialize_cached_version(
         self,
@@ -796,22 +783,6 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
                 self._record_validated_cache(version, cache_key)
                 return
 
-        published_version_path = self.published_versions_dir / version
-        if not published_version_path.is_dir():
-            raise BundleManifestNotFoundError(
-                f"Bundle '{self.name}' version '{version}' is not published at {published_version_path}. "
-                "Publish or restore the immutable snapshot before running pinned work."
-            )
-
-        # Structural pass only (no hashing): reject symlinks, special files, and
-        # unexpected entries before copytree touches them.
-        self._validate_materialized_version(
-            version_path=published_version_path,
-            version=version,
-            manifest_ref=manifest_ref,
-            check_content=False,
-        )
-
         tmp_path = Path(
             tempfile.mkdtemp(
                 prefix=_get_manifest_temp_snapshot_prefix(version),
@@ -819,7 +790,19 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             )
         )
         try:
-            shutil.copytree(published_version_path, tmp_path, copy_function=shutil.copy2, dirs_exist_ok=True)
+            # The store runs a structural pass on the published tree first (no hashing):
+            # reject symlinks, special files, and unexpected entries before any bytes
+            # are transferred.
+            self._store.fetch_snapshot(
+                version,
+                tmp_path,
+                structural_validator=lambda tree: self._validate_materialized_version(
+                    version_path=tree,
+                    version=version,
+                    manifest_ref=manifest_ref,
+                    check_content=False,
+                ),
+            )
             # Validating the copy also validates the published source in one read pass.
             self._validate_materialized_version(
                 version_path=tmp_path,
@@ -893,8 +876,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         return self._current_manifest_ref
 
     def _read_current_manifest_ref(self) -> BundleManifestRef:
-        payload = self._read_json_file(
-            self.manifest_ref_path,
+        payload = self._store.read_ref(
             missing_message=(
                 f"Bundle '{self.name}' manifest reference file {self.manifest_ref_path} is missing. "
                 "Configure an automatic publication source, run the explicit publisher, or "
@@ -1362,6 +1344,150 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
                     entry.unlink()
 
 
+class FilesystemArtifactStore(ArtifactStore):
+    """
+    Shared-filesystem artifact store: the package's original ``published_root`` layout.
+
+    Implemented with the module helpers in this file so their durability behavior
+    (atomic renames, fsyncs, permissions, orphan sweeps) stays in one place. The
+    helpers are resolved through module globals at call time.
+    """
+
+    def __init__(self, *, bundle_name: str, published_root: Path, cache_root: Path) -> None:
+        self.bundle_name = bundle_name
+        if _paths_overlap(published_root, cache_root):
+            raise ValueError(
+                "published_root must not overlap Airflow's bundle cache. Configure separate "
+                "authoritative publication and dag_bundle_storage_path locations."
+            )
+        self._root = published_root
+        self._ref_path = published_root / "refs" / bundle_name / "latest.json"
+        self._snapshots_root = published_root / "versions" / bundle_name
+        self._state_path = published_root / "_state" / bundle_name / AUTO_PUBLISH_STATE_FILE_NAME
+        self.lock_path = published_root / "_locks" / f"{bundle_name}.lock"
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def ref_path(self) -> Path:
+        return self._ref_path
+
+    @property
+    def state_path(self) -> Path:
+        return self._state_path
+
+    @property
+    def snapshots_root(self) -> Path:
+        return self._snapshots_root
+
+    def snapshot_path(self, version: str) -> Path:
+        return self._snapshots_root / version
+
+    def read_ref(self, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
+        return ManifestDagBundleBase._read_json_file(
+            self._ref_path, missing_message=missing_message, invalid_message=invalid_message
+        )
+
+    def write_ref(self, payload: dict[str, Any]) -> None:
+        _write_manifest_ref_atomically(self._ref_path, payload)
+
+    def read_state(self, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
+        return ManifestDagBundleBase._read_json_file(
+            self._state_path, missing_message=missing_message, invalid_message=invalid_message
+        )
+
+    def write_state(self, payload: dict[str, Any]) -> None:
+        _remove_orphaned_atomic_temp_files(self._state_path)
+        _write_json_atomically(self._state_path, payload)
+
+    @contextmanager
+    def publication_guard(self):
+        """Serialize publishers through a lock stored with the authoritative snapshots."""
+        _ensure_public_dir(self.lock_path.parent)
+        # flock works on a read-only descriptor, so publishers running as different OS
+        # users can all acquire the lock created by whichever user published first.
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_RDONLY, 0o644)
+        except PermissionError as e:
+            raise BundleManifestError(
+                f"Cannot open publication lock {self.lock_path}: another OS user "
+                "created it with restrictive permissions. Make it world-readable (chmod 0644) "
+                "and retry."
+            ) from e
+        with os.fdopen(fd, "r") as lock_file:
+            # os.open masks the mode with the umask; repair it whenever this publisher
+            # owns the file so a crash cannot leave it unreadable for other publishers.
+            with suppress(OSError):
+                os.fchmod(fd, 0o644)
+            flock(lock_file, LOCK_EX)
+            try:
+                yield
+            finally:
+                flock(lock_file, LOCK_UN)
+
+    def prepare_publish_areas(self) -> None:
+        _ensure_public_dir(self._snapshots_root)
+        _ensure_public_dir(self._ref_path.parent)
+
+    def prepare_state_area(self) -> None:
+        _ensure_public_dir(self._state_path.parent)
+
+    def validate_source_paths(self, source_path: Path, *, cache_versions_dir: Path) -> None:
+        _validate_publish_paths(
+            source_path=source_path,
+            published_root=self._root,
+            versions_dir=cache_versions_dir,
+        )
+
+    def snapshot_exists(self, version: str) -> bool:
+        return (self._snapshots_root / version).is_dir()
+
+    def fetch_snapshot(
+        self,
+        version: str,
+        destination: Path,
+        *,
+        structural_validator: Callable[[Path], None],
+    ) -> None:
+        published_version_path = self._snapshots_root / version
+        if not published_version_path.is_dir():
+            raise BundleManifestNotFoundError(
+                f"Bundle '{self.bundle_name}' version '{version}' is not published at "
+                f"{published_version_path}. Publish or restore the immutable snapshot before "
+                "running pinned work."
+            )
+        structural_validator(published_version_path)
+        shutil.copytree(published_version_path, destination, copy_function=shutil.copy2, dirs_exist_ok=True)
+
+    def publish_snapshot(
+        self,
+        version: str,
+        *,
+        manifest: dict[str, Any],
+        source_root: Path,
+        validate_existing: Callable[[Path], None],
+    ) -> bool:
+        version_path = self._snapshots_root / version
+        if version_path.exists():
+            if not version_path.is_dir():
+                raise FileExistsError(f"Bundle snapshot path exists but is not a directory: {version_path}")
+            validate_existing(version_path)
+            return False
+        _materialize_manifest_snapshot(
+            source_path=source_root,
+            manifest=manifest,
+            versions_dir=self._snapshots_root,
+            version_path=version_path,
+        )
+        return True
+
+    def sweep_publish_temps(self) -> None:
+        _remove_orphaned_manifest_temp_snapshots(self._snapshots_root)
+        _remove_orphaned_atomic_temp_files(self._ref_path)
+
+
 def publish_prepared_manifest_dag_bundle(
     *,
     bundle: ManifestDagBundleBase,
@@ -1370,18 +1496,13 @@ def publish_prepared_manifest_dag_bundle(
 ) -> BundlePublishResult:
     """Publish one prepared local tree as an immutable manifest-backed snapshot."""
     source_path = prepared_source.root
-    _validate_publish_paths(
-        source_path=source_path,
-        published_root=bundle.published_root,
-        versions_dir=bundle.versions_dir,
-    )
+    bundle._store.validate_source_paths(source_path, cache_versions_dir=bundle.versions_dir)
     if not prepared_source.source_snapshot.files and not bundle.allow_empty_source:
         raise BundleManifestError(
             f"Refusing to explicitly publish empty source tree {source_path} for bundle "
             f"'{bundle.name}'; set allow_empty_source=True if removing every Dag is intended"
         )
-    _ensure_public_dir(bundle.published_versions_dir)
-    _ensure_public_dir(bundle.manifest_ref_path.parent)
+    bundle._store.prepare_publish_areas()
     with bundle.acquire_publication_lock():
         if expected_current_version is not None:
             expected_current_version = _validate_manifest_version(
@@ -1432,26 +1553,18 @@ def _publish_manifest_result(
     if prepared_source.release_source_metadata is not None:
         ref_payload["source"] = prepared_source.release_source_metadata
     manifest_ref = bundle._manifest_ref_from_payload(ref_payload, source="publisher")
-    version_path = bundle.published_versions_dir / manifest_result.version
+    version_path = bundle._store.snapshot_path(manifest_result.version)
 
-    _remove_orphaned_manifest_temp_snapshots(bundle.published_versions_dir)
-    _remove_orphaned_atomic_temp_files(bundle.manifest_ref_path)
-    created_snapshot = False
-    if version_path.exists():
-        if not version_path.is_dir():
-            raise FileExistsError(f"Bundle snapshot path exists but is not a directory: {version_path}")
-        bundle._validate_snapshot_for_ref(manifest_ref, version_path)
-    else:
-        _materialize_manifest_snapshot(
-            source_path=prepared_source.root,
-            manifest=manifest_result.manifest,
-            versions_dir=bundle.published_versions_dir,
-            version_path=version_path,
-        )
-        created_snapshot = True
+    bundle._store.sweep_publish_temps()
+    created_snapshot = bundle._store.publish_snapshot(
+        manifest_result.version,
+        manifest=manifest_result.manifest,
+        source_root=prepared_source.root,
+        validate_existing=lambda tree: bundle._validate_snapshot_for_ref(manifest_ref, tree),
+    )
 
     bundle._confirm_publish_source(prepared_source)
-    _write_manifest_ref_atomically(bundle.manifest_ref_path, ref_payload)
+    bundle._store.write_ref(ref_payload)
 
     return BundlePublishResult(
         bundle_name=bundle.name,
