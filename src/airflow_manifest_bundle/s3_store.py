@@ -42,7 +42,7 @@ from airflow_manifest_bundle.manifest import (
 from airflow_manifest_bundle.store import ArtifactStore, ArtifactStoreConflictError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 try:
@@ -414,6 +414,7 @@ class S3ArtifactStore(ArtifactStore):
         manifest: dict[str, Any],
         source_root: Path,
         validate_existing: Callable[[Path], None],
+        copy_hints: Mapping[str, dict[str, Any]] | None = None,
     ) -> bool:
         # ``validate_existing`` walks a filesystem tree; the object-store equivalent is
         # comparing the committed manifest bytes — the manifest is content-addressed, so
@@ -429,8 +430,20 @@ class S3ArtifactStore(ArtifactStore):
                 )
             return False
 
+        # One failed copy that is not a per-object precondition miss disables further
+        # attempts for this publication: a systemic cause (permissions, cross-account,
+        # unsupported operation) would otherwise fail once per file.
+        copy_disabled = not copy_hints
         for file_info in manifest["files"]:
             relative_path = ManifestDagBundleBase._validate_manifest_file_info(file_info)
+            destination_key = self._snapshot_key(version, *relative_path.split("/"))
+            if not copy_disabled:
+                copied, copy_disabled = self._try_server_side_copy(
+                    hint=copy_hints.get(relative_path),
+                    destination_key=destination_key,
+                )
+                if copied:
+                    continue
             source = source_root / relative_path
             try:
                 data = source.read_bytes()
@@ -449,13 +462,67 @@ class S3ArtifactStore(ArtifactStore):
                 raise BundleManifestSourceChangedError(
                     f"Bundle source changed while publishing bundle version {version}"
                 )
-            self._put_object(self._snapshot_key(version, *relative_path.split("/")), data)
+            self._put_object(destination_key, data)
 
         # The manifest goes last: its presence commits the snapshot. Unconditional on
         # purpose — same-content publishers write identical bytes, and overwriting a
         # corrupt manifest with the correct one is self-healing.
         self._put_object(manifest_key, manifest_bytes)
         return True
+
+    def _try_server_side_copy(
+        self,
+        *,
+        hint: dict[str, Any] | None,
+        destination_key: str,
+    ) -> tuple[bool, bool]:
+        """
+        Attempt one server-side copy. Returns (copied, disable_further_attempts).
+
+        ``CopySourceIfMatch`` pins the copy to the exact object the manifest hashes
+        were computed from: if the source moved on, the store refuses the copy and the
+        caller uploads the prepared local bytes instead — which still match the
+        manifest. A lying object store is caught at fetch time, where every file is
+        hash-verified against the manifest before use.
+        """
+        if not isinstance(hint, dict) or hint.get("type") != "s3":
+            return False, False
+        bucket = hint.get("bucket")
+        key = hint.get("key")
+        etag = hint.get("etag")
+        if not all(isinstance(value, str) and value for value in (bucket, key, etag)):
+            return False, False
+        client = self._get_client()
+        endpoint = getattr(getattr(client, "meta", None), "endpoint_url", None)
+        if hint.get("endpoint") != endpoint:
+            # Different endpoints cannot copy server-side; no point retrying per file.
+            return False, True
+        try:
+            client.copy_object(
+                Bucket=self.bucket_name,
+                Key=destination_key,
+                CopySource={"Bucket": bucket, "Key": key},
+                CopySourceIfMatch=etag,
+            )
+        except Exception as e:
+            code = _s3_error_code(e)
+            if code in _CONDITIONAL_WRITE_CONFLICT_CODES or _is_missing_s3_object_error(e):
+                # This one object changed or vanished since it was observed; the
+                # prepared local copy still matches the manifest, so upload it and
+                # keep trying copies for the remaining files.
+                log.debug(
+                    "Server-side copy precondition failed; uploading the prepared copy. "
+                    "destination=%s",
+                    self._url(destination_key),
+                )
+                return False, False
+            log.info(
+                "Server-side copy failed; publishing by upload instead. destination=%s",
+                self._url(destination_key),
+                exc_info=True,
+            )
+            return False, True
+        return True, False
 
     def _put_object(self, key: str, body: bytes) -> None:
         client = self._get_client()

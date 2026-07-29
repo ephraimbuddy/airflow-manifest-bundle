@@ -170,6 +170,26 @@ def test_common_base_and_concrete_bundles_are_siblings():
     assert ManifestS3DagBundle.__bases__ == (ManifestDagBundleBase,)
 
 
+def test_prepare_publish_source_populates_copy_hints(tmp_path, monkeypatch):
+    client = FakeS3Client()
+    client.put("dags/example.py", b"print('dag')")
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+        bundle = _bundle(tmp_path)
+        prepared = bundle._prepare_publish_source()
+
+    assert prepared.copy_hints == {
+        "example.py": {
+            "type": "s3",
+            "endpoint": "https://s3.example.test",
+            "bucket": "dag-bucket",
+            "key": "dags/example.py",
+            "etag": client.objects["dags/example.py"]["etag"],
+        }
+    }
+
+
 def test_constructor_matches_oss_defaults_and_constructs_hook_lazily(tmp_path, monkeypatch):
     client = FakeS3Client()
     client.put("dags/example.py", b"print('dag')")

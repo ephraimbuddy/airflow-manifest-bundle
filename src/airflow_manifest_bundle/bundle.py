@@ -11,7 +11,7 @@ import stat
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from fcntl import LOCK_EX, LOCK_UN, flock
@@ -128,6 +128,12 @@ class PreparedPublishSource:
     file_sha256_by_path: dict[str, str] | None = None
     confirmation_data: Any = None
     release_source_metadata: dict[str, Any] | None = None
+    #: Optional per-file transport hints (relative path -> backend-specific locator)
+    #: that let a store move published bytes without routing them through this host,
+    #: e.g. an S3 server-side copy. Hints are an optimization only: a store may
+    #: ignore them, and correctness never depends on them — consumers hash-verify
+    #: every fetched file against the manifest regardless.
+    copy_hints: Mapping[str, dict[str, Any]] | None = None
 
 
 class ManifestDagBundleBase(BaseDagBundle, ABC):
@@ -1531,7 +1537,10 @@ class FilesystemArtifactStore(ArtifactStore):
         manifest: dict[str, Any],
         source_root: Path,
         validate_existing: Callable[[Path], None],
+        copy_hints: Mapping[str, dict[str, Any]] | None = None,
     ) -> bool:
+        # copy_hints are remote-transport locators; a filesystem store always copies
+        # from the prepared local tree.
         version_path = self._snapshots_root / version
         if version_path.exists():
             if not version_path.is_dir():
@@ -1635,6 +1644,7 @@ def _publish_manifest_result(
         manifest=manifest_result.manifest,
         source_root=prepared_source.root,
         validate_existing=lambda tree: bundle._validate_snapshot_for_ref(manifest_ref, tree),
+        copy_hints=prepared_source.copy_hints,
     )
 
     bundle._confirm_publish_source(prepared_source)

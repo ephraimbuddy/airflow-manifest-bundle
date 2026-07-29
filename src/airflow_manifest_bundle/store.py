@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from airflow_manifest_bundle.manifest import BundleManifestError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from contextlib import AbstractContextManager
     from pathlib import Path
 
@@ -170,6 +170,7 @@ class ArtifactStore(ABC):
         manifest: dict[str, Any],
         source_root: Path,
         validate_existing: Callable[[Path], None],
+        copy_hints: Mapping[str, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Commit an immutable snapshot for ``version`` from a prepared local tree.
@@ -177,6 +178,12 @@ class ArtifactStore(ABC):
         Idempotent: when the version already exists, ``validate_existing`` checks it
         against the manifest reference and nothing is written. Returns whether a new
         snapshot was created.
+
+        ``copy_hints`` (relative path -> backend-specific locator) may let the store
+        move bytes without routing them through this host. They are an optimization
+        only: any hint may be ignored or fail, in which case the store publishes from
+        ``source_root``; correctness never depends on a hint because consumers verify
+        every fetched file against the manifest.
         """
 
     @abstractmethod

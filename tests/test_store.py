@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -248,12 +249,36 @@ class FakeStoreS3Client:
     """Just enough of the S3 API for the artifact store, with conditional-write semantics."""
 
     def __init__(self) -> None:
+        self.meta = SimpleNamespace(endpoint_url="https://store.example.test")
         self.objects: dict[str, bytes] = {}
         self.etags: dict[str, str] = {}
         self.put_sequence: list[str] = []
         self.put_conditions: list[tuple[str, str | None, str | None]] = []
         self.fail_conditional_writes_with: str | None = None
+        self.source_objects: dict[tuple[str, str], tuple[bytes, str]] = {}
+        self.copies: list[tuple[str, str, str]] = []
+        self.copy_attempts = 0
+        self.fail_copy_with: str | None = None
         self._etag_counter = 0
+
+    def add_source_object(self, bucket: str, key: str, body: bytes, *, etag: str) -> None:
+        self.source_objects[(bucket, key)] = (body, etag)
+
+    def copy_object(self, *, Bucket: str, Key: str, CopySource, CopySourceIfMatch=None):
+        assert Bucket == BUCKET
+        self.copy_attempts += 1
+        if self.fail_copy_with:
+            raise FakeStoreClientError(self.fail_copy_with)
+        source = (CopySource["Bucket"], CopySource["Key"])
+        if source not in self.source_objects:
+            raise FakeStoreClientError("NoSuchKey")
+        body, etag = self.source_objects[source]
+        if CopySourceIfMatch is not None and etag != CopySourceIfMatch:
+            raise FakeStoreClientError("PreconditionFailed")
+        self.objects[Key] = body
+        self.etags[Key] = self._next_etag()
+        self.copies.append((source[0], source[1], Key))
+        return {"CopyObjectResult": {"ETag": self.etags[Key]}}
 
     def _next_etag(self) -> str:
         self._etag_counter += 1
@@ -575,6 +600,139 @@ class TestS3StorePublishSnapshot:
                 validate_existing=lambda tree: None,
             )
         assert store.snapshot_exists(result.version) is False
+
+
+def _two_file_source(root: Path) -> Path:
+    _write_source(root)
+    (root / "dags" / "second.py").write_text("print('second')\n")
+    return root
+
+
+def _copy_hints_for(source: Path, result, *, endpoint="https://store.example.test"):
+    return {
+        file_info["path"]: {
+            "type": "s3",
+            "endpoint": endpoint,
+            "bucket": "source-bucket",
+            "key": f"dags-src/{file_info['path']}",
+            "etag": f'"src-{file_info["path"]}"',
+        }
+        for file_info in result.manifest["files"]
+    }
+
+
+def _seed_copy_sources(fake_s3, source: Path, hints) -> None:
+    for path, hint in hints.items():
+        fake_s3.add_source_object(
+            hint["bucket"], hint["key"], (source / path).read_bytes(), etag=hint["etag"]
+        )
+
+
+class TestS3StoreServerSideCopy:
+    def _publish_with_hints(self, fake_s3, source, hints):
+        result = _manifest_result(source)
+        store = _s3_artifact_store()
+        created = store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+            copy_hints=hints,
+        )
+        return store, result, created
+
+    def test_matching_endpoint_copies_instead_of_uploading(self, fake_s3, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _copy_hints_for(source, result)
+        _seed_copy_sources(fake_s3, source, hints)
+
+        store, result, created = self._publish_with_hints(fake_s3, source, hints)
+
+        assert created is True
+        assert len(fake_s3.copies) == len(result.manifest["files"])
+        snapshot_puts = [key for key in fake_s3.put_sequence if f"/{result.version}/" in key]
+        assert snapshot_puts == [
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/{MANIFEST_FILE_NAME}"
+        ]
+        destination = tmp_path / "dest"
+        destination.mkdir()
+        store.fetch_snapshot(result.version, destination, structural_validator=lambda tree: None)
+        assert (destination / "dags" / "second.py").read_text() == "print('second')\n"
+
+    def test_endpoint_mismatch_uploads_everything(self, fake_s3, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _copy_hints_for(source, result, endpoint="https://elsewhere.example.test")
+        _seed_copy_sources(fake_s3, source, hints)
+
+        store, result, created = self._publish_with_hints(fake_s3, source, hints)
+
+        assert created is True
+        assert fake_s3.copies == []
+        assert store.snapshot_exists(result.version)
+
+    def test_stale_source_etag_falls_back_for_that_file_only(self, fake_s3, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _copy_hints_for(source, result)
+        _seed_copy_sources(fake_s3, source, hints)
+        stale = hints["dags/example.py"]
+        fake_s3.add_source_object(
+            stale["bucket"], stale["key"], b"moved on", etag='"a-newer-etag"'
+        )
+
+        _store, result, created = self._publish_with_hints(fake_s3, source, hints)
+
+        assert created is True
+        assert len(fake_s3.copies) == 1
+        uploaded = [
+            key
+            for key in fake_s3.put_sequence
+            if f"/{result.version}/" in key and not key.endswith(MANIFEST_FILE_NAME)
+        ]
+        assert uploaded == [
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/dags/example.py"
+        ]
+        # The published object carries the manifest's bytes, not the moved-on source.
+        assert (
+            fake_s3.objects[f"releases/versions/{BUNDLE_NAME}/{result.version}/dags/example.py"]
+            == b"print('dag')\n"
+        )
+
+    def test_systemic_copy_failure_disables_further_attempts(self, fake_s3, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _copy_hints_for(source, result)
+        _seed_copy_sources(fake_s3, source, hints)
+        fake_s3.fail_copy_with = "AccessDenied"
+
+        store, result, created = self._publish_with_hints(fake_s3, source, hints)
+
+        assert created is True
+        assert fake_s3.copy_attempts == 1
+        assert fake_s3.copies == []
+        assert store.snapshot_exists(result.version)
+
+    def test_lying_copy_source_is_detected_at_fetch(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _copy_hints_for(source, result)
+        hint = hints["dags/example.py"]
+        # The remote object claims the observed ETag but carries different bytes.
+        fake_s3.add_source_object(
+            hint["bucket"], hint["key"], b"print('corrupted')\n", etag=hint["etag"]
+        )
+
+        store, result, created = self._publish_with_hints(fake_s3, source, hints)
+        assert created is True
+
+        destination = tmp_path / "dest"
+        destination.mkdir()
+        with pytest.raises(BundleManifestError, match="does not match the snapshot manifest"):
+            store.fetch_snapshot(
+                result.version, destination, structural_validator=lambda tree: None
+            )
 
 
 def _version_string(version) -> str:

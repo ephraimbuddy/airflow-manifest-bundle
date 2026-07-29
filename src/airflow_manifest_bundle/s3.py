@@ -228,6 +228,20 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         }
         if observation.marker_signature is not None:
             release_source_metadata["deployment_marker"] = observation.marker_signature
+        # Transport hints for an object-store published_root: each observed object,
+        # pinned to its ETag, so the store can server-side copy instead of uploading
+        # the mirror bytes. Optimization only — any hint may fail back to upload.
+        endpoint = getattr(getattr(client, "meta", None), "endpoint_url", None)
+        copy_hints = {
+            entry.relative_path: {
+                "type": "s3",
+                "endpoint": endpoint if isinstance(endpoint, str) else None,
+                "bucket": self.bucket_name,
+                "key": entry.key,
+                "etag": entry.etag,
+            }
+            for entry in observation.entries
+        }
         return PreparedPublishSource(
             root=self.s3_dags_dir,
             source_snapshot=snapshot,
@@ -237,6 +251,7 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
             file_sha256_by_path=file_sha256_by_path,
             confirmation_data=observation,
             release_source_metadata=release_source_metadata,
+            copy_hints=copy_hints,
         )
 
     def _publish_from_source_if_ready(
