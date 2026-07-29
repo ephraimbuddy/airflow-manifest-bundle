@@ -34,6 +34,9 @@ BUNDLE_NAME = "contract"
 BUCKET = "dag-bucket"
 
 
+# The S3 store cannot join this parametrization until it supports publication —
+# half of these contract tests publish. When it does, split the suite into
+# read-contract and publish-contract classes and parametrize both.
 @pytest.fixture(params=["filesystem"])
 def store(request, tmp_path):
     if request.param == "filesystem":
@@ -426,6 +429,39 @@ class TestBundleWithObjectStoreRoot:
             assert _version_string(bundle.get_current_version()) == result.version
             assert (bundle.path / "dags" / "example.py").read_text() == "print('dag')\n"
 
+    def test_refresh_follows_ref_updates_and_keeps_old_versions(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        first = _publish_to_fake_s3(fake_s3, prefix="releases", bundle_name="my-dags", source=source)
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+            )
+            bundle.initialize()
+            assert _version_string(bundle.get_current_version()) == first.version
+
+            (source / "dags" / "example.py").write_text("print('v2')\n")
+            second = _publish_to_fake_s3(
+                fake_s3, prefix="releases", bundle_name="my-dags", source=source
+            )
+            bundle.refresh()
+
+            assert _version_string(bundle.get_current_version()) == second.version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('v2')\n"
+            # The previous version stays materialized for pinned work.
+            old_copy = bundle.versions_dir / first.version / "dags" / "example.py"
+            assert old_copy.read_text() == "print('dag')\n"
+
+    def test_missing_bucket_is_a_configuration_error_not_a_missing_release(self, fake_s3):
+        store = _s3_artifact_store()
+
+        def missing_bucket(**kwargs):
+            raise FakeStoreClientError("NoSuchBucket")
+
+        fake_s3.get_object = missing_bucket
+        with pytest.raises(BundleManifestError, match="does not exist. Fix the published_root"):
+            store.read_ref(missing_message="ref is gone", invalid_message="invalid")
+
     def test_pinned_initialize_materializes_from_object_store(self, fake_s3, tmp_path):
         source = _write_source(tmp_path / "source")
         result = _publish_to_fake_s3(fake_s3, prefix="releases", bundle_name="my-dags", source=source)
@@ -488,6 +524,31 @@ class TestBundleWithObjectStoreRoot:
             )
             bundle.refresh()
             assert fake_s3.seen_conn_ids == ["aws_publishing"]
+
+    def test_uppercase_scheme_selects_the_object_store(self, fake_s3, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"S3://{BUCKET}/releases",
+            )
+            assert bundle.published_root == f"s3://{BUCKET}/releases"
+
+    @pytest.mark.parametrize("root", ["s3:/bucket/releases", "gcs://bucket/releases", "s3:releases"])
+    def test_url_shaped_roots_with_unsupported_schemes_are_rejected(self, root, tmp_path):
+        with (
+            conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+            pytest.raises(TypeError, match="Unsupported published_root scheme"),
+        ):
+            ManifestLocalDagBundle(name="my-dags", published_root=root)
+
+    def test_publication_lock_path_explains_object_store_roots(self, fake_s3, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+            )
+            with pytest.raises(AttributeError, match="no publication lock file"):
+                _ = bundle.publication_lock_path
 
     def test_conn_id_rejected_for_filesystem_root(self, tmp_path):
         with (

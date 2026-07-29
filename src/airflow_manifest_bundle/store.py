@@ -105,7 +105,13 @@ class ArtifactStore(ABC):
 
     @abstractmethod
     def validate_source_paths(self, source_path: Path, *, cache_versions_dir: Path) -> None:
-        """Reject a publish source that overlaps this store or the local cache."""
+        """
+        Reject a publish source that overlaps this store or the local cache.
+
+        Raises ``ValueError`` for an overlap; a store with ``supports_publication``
+        False raises ``BundleManifestError`` instead, like its other publish
+        operations.
+        """
 
     # --- snapshots ------------------------------------------------------------
 

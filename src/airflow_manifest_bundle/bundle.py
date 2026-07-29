@@ -172,15 +172,25 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             # callbacks with a misleading log. TypeError matches how any bundle class fails
             # on a bad config kwarg.
             raise TypeError("published_root must be provided")
-        if str(published_root).startswith("s3://"):
+        published_root_str = str(published_root)
+        if published_root_str.lower().startswith("s3://"):
             from airflow_manifest_bundle.s3_store import S3ArtifactStore
 
             self._store: ArtifactStore = S3ArtifactStore(
                 bundle_name=self.name,
-                published_root=str(published_root),
+                published_root=published_root_str,
                 aws_conn_id=published_root_conn_id,
             )
         else:
+            # A URL-shaped value that is not a supported scheme must fail loudly instead
+            # of becoming a filesystem directory literally named after the URL. This also
+            # catches an s3 URL mangled by pathlib (``Path("s3://b")`` collapses to
+            # ``s3:/b``), which no longer matches the scheme check above.
+            if ":" in published_root_str.split("/", 1)[0]:
+                raise TypeError(
+                    f"Unsupported published_root scheme: {published_root_str!r}. Use a "
+                    "filesystem path or an s3:// URL."
+                )
             if published_root_conn_id is not None:
                 raise TypeError(
                     "published_root_conn_id is only valid with an object-store published_root"
@@ -231,7 +241,13 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     @property
     def publication_lock_path(self) -> Path:
-        return self._store.lock_path
+        lock_path = getattr(self._store, "lock_path", None)
+        if lock_path is None:
+            raise AttributeError(
+                "an object-store published_root has no publication lock file; publisher "
+                "coordination is store-native"
+            )
+        return lock_path
 
     @property
     @abstractmethod

@@ -50,19 +50,29 @@ _PUBLICATION_UNSUPPORTED_MESSAGE = (
 )
 
 
-def _is_missing_s3_object_error(error: Exception) -> bool:
+def _s3_error_code(error: Exception) -> str | None:
     response = getattr(error, "response", None)
     if not isinstance(response, dict):
-        return False
+        return None
     error_data = response.get("Error")
     if not isinstance(error_data, dict):
-        return False
-    return str(error_data.get("Code")) in {"404", "NoSuchBucket", "NoSuchKey", "NotFound"}
+        return None
+    return str(error_data.get("Code"))
+
+
+def _is_missing_s3_object_error(error: Exception) -> bool:
+    # NoSuchBucket is deliberately not in this set: a missing bucket is a
+    # configuration problem and must not read as "the artifact is not published".
+    return _s3_error_code(error) in {"404", "NoSuchKey", "NotFound"}
+
+
+def _is_missing_s3_bucket_error(error: Exception) -> bool:
+    return _s3_error_code(error) == "NoSuchBucket"
 
 
 def parse_s3_published_root(published_root: str) -> tuple[str, str]:
     """Split ``s3://bucket[/prefix]`` into (bucket, normalized prefix without slashes)."""
-    if not published_root.startswith(S3_PUBLISHED_ROOT_SCHEME):
+    if not published_root[: len(S3_PUBLISHED_ROOT_SCHEME)].lower() == S3_PUBLISHED_ROOT_SCHEME:
         raise TypeError(f"published_root {published_root!r} is not an s3:// URL")
     remainder = published_root[len(S3_PUBLISHED_ROOT_SCHEME) :]
     bucket, _, prefix = remainder.partition("/")
@@ -173,9 +183,7 @@ class S3ArtifactStore(ArtifactStore):
         except Exception as e:
             if _is_missing_s3_object_error(e):
                 return None
-            raise BundleManifestError(
-                f"Could not read {self._url(key)} from the object-store published_root"
-            ) from e
+            raise self._read_error(key, e) from e
 
     def _object_exists(self, key: str) -> bool:
         client = self._get_client()
@@ -184,10 +192,18 @@ class S3ArtifactStore(ArtifactStore):
         except Exception as e:
             if _is_missing_s3_object_error(e):
                 return False
-            raise BundleManifestError(
-                f"Could not read {self._url(key)} from the object-store published_root"
-            ) from e
+            raise self._read_error(key, e) from e
         return True
+
+    def _read_error(self, key: str, error: Exception) -> BundleManifestError:
+        if _is_missing_s3_bucket_error(error):
+            return BundleManifestError(
+                f"S3 bucket {self.bucket_name!r} for published_root {self.root} does not "
+                "exist. Fix the published_root configuration before refreshing this bundle."
+            )
+        return BundleManifestError(
+            f"Could not read {self._url(key)} from the object-store published_root"
+        )
 
     # --- mutable documents ----------------------------------------------------
 
@@ -301,9 +317,7 @@ class S3ArtifactStore(ArtifactStore):
                     f"Bundle snapshot at {self._url(key)} is missing manifest entry "
                     f"{file_info['path']!r}"
                 ) from e
-            raise BundleManifestError(
-                f"Could not read {self._url(key)} from the object-store published_root"
-            ) from e
+            raise self._read_error(key, e) from e
         if size != file_info["size"] or digest.hexdigest() != file_info["sha256"]:
             raise BundleManifestError(
                 f"Bundle snapshot file {file_info['path']!r} does not match the snapshot manifest"
