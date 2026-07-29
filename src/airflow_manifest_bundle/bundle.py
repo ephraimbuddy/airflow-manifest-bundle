@@ -138,10 +138,12 @@ class PreparedPublishSource:
 
 class ManifestDagBundleBase(BaseDagBundle, ABC):
     """
-    Shared runtime for filesystem-published content-addressed bundle manifests.
+    Shared runtime for content-addressed manifest Dag bundles.
 
-    Concrete adapters prepare a local source tree for automatic publication. Airflow
-    only parses immutable, validated copies from ``versions_dir``.
+    Concrete source adapters prepare a local source tree for publication; an
+    artifact store keeps the published releases on a shared filesystem or in an
+    object store. Airflow only parses immutable, validated copies from
+    ``versions_dir``.
 
     :param published_root: Root containing published snapshots and the current release
         reference: a shared filesystem path, or an ``s3://bucket/prefix`` URL for an
