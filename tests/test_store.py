@@ -975,6 +975,22 @@ class TestBundleWithObjectStoreRoot:
                     expected_current_version="sha256-" + "0" * 64,
                 )
 
+    def test_object_store_root_for_s3_source_logs_no_fallback_hint(
+        self, fake_s3, tmp_path, caplog
+    ):
+        from airflow_manifest_bundle.s3 import ManifestS3DagBundle
+
+        with (
+            conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+            caplog.at_level("INFO", logger="airflow_manifest_bundle.s3"),
+        ):
+            ManifestS3DagBundle(
+                name="my-dags",
+                bucket_name="source-bucket",
+                published_root=f"s3://{BUCKET}/releases",
+            )
+        assert "removes the shared filesystem" not in caplog.text
+
     def test_consume_only_guard_still_protects_against_non_publishing_stores(
         self, fake_s3, tmp_path, monkeypatch
     ):

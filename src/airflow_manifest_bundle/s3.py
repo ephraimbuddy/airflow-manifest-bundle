@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
     BundleManifestRef,
+    FilesystemArtifactStore,
     ManifestDagBundleBase,
     PreparedPublishSource,
     _write_json_atomically,
@@ -142,6 +143,14 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
                 "auto_publish requires a published_root that supports publication; the "
                 "configured published_root is consume-only. Set auto_publish=False or use "
                 "a published_root that publishers can write."
+            )
+        if isinstance(self._store, FilesystemArtifactStore):
+            log.info(
+                "Bundle '%s' reads its Dag source from S3 but publishes releases to the "
+                "filesystem published_root %s. An s3:// published_root removes the shared "
+                "filesystem; see the S3 operator guide.",
+                self.name,
+                self.published_root,
             )
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_object_key = (

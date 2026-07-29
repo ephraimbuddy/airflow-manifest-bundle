@@ -77,35 +77,10 @@ dag_bundle_config_list = [
   ]
 ```
 
-For S3, keep the same authoritative local `published_root` and replace only the
-source adapter:
-
-```ini
-[dag_processor]
-dag_bundle_config_list = [
-    {
-      "name": "my_dags",
-      "classpath": "airflow_manifest_bundle.s3.ManifestS3DagBundle",
-      "kwargs": {
-        "bucket_name": "airflow-dags",
-        "prefix": "dags/",
-        "published_root": "/shared/dag-releases",
-        "refresh_interval": 30,
-        "deployment_marker_key": ".ready"
-      }
-    }
-  ]
-```
-
-`aws_conn_id` is optional and defaults to `aws_default`, as it does for Airflow's
-stock `S3DagBundle`. The S3 adapter lists and reads objects. It never writes to the
-Dag source. It mirrors the folder into disposable local staging, but Airflow never
-parses or executes that mirror. See the [S3 operator guide](docs/s3.md) for IAM,
-deployment markers, storage, and recovery.
-
-`published_root` also accepts an `s3://bucket/prefix` URL, which removes the shared
-filesystem entirely — the Dag source, the immutable releases, and the coordination
-state all live in the object store:
+For S3, replace the source adapter. The recommended `published_root` for an S3
+source is an `s3://` prefix — the Dag source, the immutable releases, and the
+coordination state all live in the object store, and no host needs a shared
+filesystem:
 
 ```ini
 [dag_processor]
@@ -124,16 +99,36 @@ dag_bundle_config_list = [
   ]
 ```
 
-With an object-store `published_root`, publishers write the releases prefix (the Dag
-source stays read-only), workers read only the releases prefix, and coordination
-uses conditional writes instead of a lock file — AWS S3 supports them; an
-S3-compatible store without `If-Match` support fails publication with a clear error.
-The optional `published_root_conn_id` selects a separate AWS connection for the
-artifact store; it defaults to the store's standard connection resolution and is
+`aws_conn_id` is optional and defaults to `aws_default`, as it does for Airflow's
+stock `S3DagBundle`. The S3 adapter lists and reads objects. It never writes to the
+Dag source; publishers write only the releases prefix. It mirrors the folder into
+disposable local staging, but Airflow never parses or executes that mirror. See the
+[S3 operator guide](docs/s3.md) for the IAM matrix, deployment markers, retention
+lifecycle rules, and Object Lock guidance.
+
+With an object-store `published_root`, workers read only the releases prefix, and
+coordination uses conditional writes instead of a lock file — AWS S3 supports them;
+an S3-compatible store without `If-Match` support fails publication with a clear
+error. The optional `published_root_conn_id` selects a separate AWS connection for
+the artifact store; it defaults to the store's standard connection resolution and is
 invalid for filesystem roots. When the source and the releases prefix share an S3
 endpoint, publication uses server-side copies and moves no file content through the
-dag processor. See the [S3 operator guide](docs/s3.md) for the IAM matrix, retention
-lifecycle rules, and Object Lock guidance.
+dag processor.
+
+A filesystem `published_root` remains supported for the S3 adapter as the fallback
+for two situations: workers that must run without any cloud credentials (they read
+only the shared path), and object stores without conditional-write support. It
+reintroduces the shared-filesystem requirement that the `s3://` mode removes:
+
+```ini
+"kwargs": {
+  "bucket_name": "airflow-dags",
+  "prefix": "dags/",
+  "published_root": "/shared/dag-releases",
+  "refresh_interval": 30,
+  "deployment_marker_key": ".ready"
+}
+```
 
 S3 automatic publication is enabled by default. Set `"auto_publish": false` when a
 deployment pipeline runs `publish-s3` and dag processors must only consume explicit

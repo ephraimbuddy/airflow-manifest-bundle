@@ -170,6 +170,19 @@ def test_common_base_and_concrete_bundles_are_siblings():
     assert ManifestS3DagBundle.__bases__ == (ManifestDagBundleBase,)
 
 
+def test_filesystem_published_root_logs_the_fallback_hint(tmp_path, monkeypatch, caplog):
+    client = FakeS3Client()
+    _install_fake_hook(monkeypatch, client)
+
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        caplog.at_level("INFO", logger="airflow_manifest_bundle.s3"),
+    ):
+        _bundle(tmp_path)
+
+    assert "s3:// published_root removes the shared filesystem" in caplog.text
+
+
 def test_prepare_publish_source_populates_copy_hints(tmp_path, monkeypatch):
     client = FakeS3Client()
     client.put("dags/example.py", b"print('dag')")
