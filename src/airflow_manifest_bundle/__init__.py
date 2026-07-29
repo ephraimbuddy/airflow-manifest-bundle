@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from airflow_manifest_bundle.bundle import ManifestDagBundleBase
 from airflow_manifest_bundle.local import (
