@@ -172,7 +172,12 @@ The stability period uses elapsed time, not a count of refresh calls. Set
 source tree atomically. A metadata stability check cannot prove that a non-atomic
 deployment has delivered every intended file. Use a staging directory plus atomic
 rename for local sources. For S3, write `deployment_marker_key` last after all
-objects are present.
+objects are present. For example, `prefix: "dags/"` and
+`deployment_marker_key: ".ready"` resolve to
+`s3://airflow-dags/dags/.ready`. Write a new commit SHA, CI run ID, or deployment
+UUID to that object for each deployment. Once configured, the marker is required;
+the bundle reads it but never writes it. See the
+[S3 deployment-boundary example](docs/s3.md#deployment-boundary).
 
 When no release exists, such as on the first start, initialization waits for the
 remaining stability period once and logs that normal wait at info level. If the source
