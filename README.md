@@ -1,7 +1,7 @@
 # airflow-manifest-bundle
 
 Manifest-backed local and S3 Dag bundles for Apache Airflow — install the package,
-point your bundle config at it, and it works with any standard Airflow 3.1+
+point your bundle config at it, and it works with any standard Airflow 3.0+
 installation.
 
 The Airflow `LocalDagBundle` cannot identify the exact source files a task retry or rerun
@@ -54,9 +54,9 @@ The base package and the local bundle do not import the Amazon provider. An
 explicit-mode S3 dag processor that only consumes published releases can also use
 the base package; install the S3 extra on the explicit publisher host.
 
-The bundle requires Apache Airflow 3.1 or newer, detected at import time with no
+The bundle requires Apache Airflow 3.0 or newer, detected at import time with no
 configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
-3.1/3.2 it returns the plain version string those releases expect.
+3.0–3.2 it returns the plain version string those releases expect.
 
 ## Configure
 

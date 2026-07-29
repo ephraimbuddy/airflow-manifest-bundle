@@ -27,7 +27,7 @@ jobs:
         include:
           # Oldest supported combination.
           - python-version: "3.10"
-            airflow-version: "3.1.8"
+            airflow-version: "3.0.6"
           # Current Airflow release.
           - python-version: "3.12"
             airflow-version: "3.3.0"

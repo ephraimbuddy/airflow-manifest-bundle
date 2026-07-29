@@ -88,10 +88,12 @@ class S3SourceObservation:
 
 class ManifestS3DagBundle(ManifestDagBundleBase):
     """
-    Mirror an S3 folder into local staging and publish immutable local snapshots.
+    Mirror an S3 folder into local staging and publish immutable snapshots.
 
-    S3 is only the mutable source. Pinned execution recovers from ``published_root``
-    and does not need an S3 client.
+    The S3 folder is the mutable source, never parsed or executed from directly.
+    Releases go to ``published_root``: an ``s3://`` prefix (recommended — pinned
+    execution then reads the releases prefix with the artifact store's S3 client),
+    or a shared filesystem path (pinned execution then needs no S3 access at all).
 
     :param max_file_count: Maximum number of included objects in one source observation.
     :param max_file_size_bytes: Maximum size of one included object.
@@ -206,8 +208,11 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
     def view_url_template(self) -> str | None:
         if self.version:
             return None
-        if self._view_url_template:
-            return self._view_url_template
+        # getattr: Airflow 3.0's BaseDagBundle does not set _view_url_template
+        # (the attribute arrived in 3.1.0).
+        configured_template = getattr(self, "_view_url_template", None)
+        if configured_template:
+            return configured_template
         url = f"https://{self.bucket_name}.s3"
         region_name = None
         if self.auto_publish:

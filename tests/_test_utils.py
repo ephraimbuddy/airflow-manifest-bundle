@@ -1,9 +1,26 @@
-"""Minimal stand-in for Airflow's ``tests_common.test_utils.config.conf_vars``."""
+"""Shared test helpers: ``conf_vars`` stand-in and CLI output parsing."""
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
+
+
+def published_payload(cli_output: str) -> dict:
+    """
+    Extract the publisher command's JSON payload from captured stdout.
+
+    DagBundlesManager may log to stdout before the command prints its payload — on
+    Airflow 3.0 including single-quoted dicts that defeat a find-the-first-brace
+    heuristic. The payload is the last block whose line is exactly ``{``.
+    """
+    lines = cli_output.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "{"]
+    # Fail with the captured output: a missing payload means the command itself
+    # failed, and that output is what diagnoses it.
+    assert starts, f"no JSON payload found in CLI output:\n{cli_output}"
+    return json.loads("\n".join(lines[starts[-1] :]))
 
 
 @contextmanager

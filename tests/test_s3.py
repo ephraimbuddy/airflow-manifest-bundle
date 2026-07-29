@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from _test_utils import conf_vars
+from _test_utils import conf_vars, published_payload
 
 from airflow_manifest_bundle import ManifestDagBundleBase, cli
 from airflow_manifest_bundle import s3 as s3_module
@@ -498,8 +498,7 @@ def test_publish_s3_command(tmp_path, monkeypatch, capsys):
     ):
         cli.main(["publish-s3", "manifest-s3", "--output", "json"])
 
-    out = capsys.readouterr().out
-    published = json.loads(out[out.index("{") :])
+    published = published_payload(capsys.readouterr().out)
     assert published["bundle_name"] == "manifest-s3"
     assert published["version"].startswith("sha256-")
     assert published["file_count"] == 1

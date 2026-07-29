@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from _test_utils import conf_vars
+from _test_utils import conf_vars, published_payload
 
 from airflow_manifest_bundle import cli
 from airflow_manifest_bundle.manifest import MANIFEST_FILE_NAME
@@ -33,9 +33,7 @@ def test_publish_local_command(tmp_path, capsys):
     ):
         cli.main(["publish-local", "manifest-local", str(source), "--output", "json"])
 
-    # DagBundlesManager may log to stdout before the command prints its JSON payload.
-    out = capsys.readouterr().out
-    published = json.loads(out[out.index("{") :])
+    published = published_payload(capsys.readouterr().out)
     assert published["bundle_name"] == "manifest-local"
     assert published["version"].startswith("sha256-")
     manifest_ref_path = published_root / "refs/manifest-local/latest.json"
