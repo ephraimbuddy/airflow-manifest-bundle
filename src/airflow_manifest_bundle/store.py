@@ -29,10 +29,22 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+from airflow_manifest_bundle.manifest import BundleManifestError
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
     from pathlib import Path
+
+
+class ArtifactStoreConflictError(BundleManifestError):
+    """
+    A concurrent publisher changed a mutable document between this store's read and write.
+
+    Raised by stores whose ``publication_guard`` is not a mutual-exclusion lock (their
+    document writes are compare-and-swap instead). Callers reconcile by re-reading:
+    the losing publisher follows the winning release rather than overwriting it.
+    """
 
 
 class ArtifactStore(ABC):
@@ -40,9 +52,9 @@ class ArtifactStore(ABC):
 
     bundle_name: str
 
-    #: Whether publishers can write releases through this store. A store that is
-    #: consume-only (for now, the object-store read path) keeps this False so
-    #: adapters can reject publish configurations at construction time.
+    #: Whether publishers can write releases through this store. A consume-only store
+    #: keeps this False so adapters can reject publish configurations at construction
+    #: time instead of failing on the first refresh.
     supports_publication: bool = True
 
     # --- locators -------------------------------------------------------------
@@ -79,7 +91,14 @@ class ArtifactStore(ABC):
 
     @abstractmethod
     def write_ref(self, payload: dict[str, Any]) -> None:
-        """Atomically replace the release reference. The last step of a publication."""
+        """
+        Atomically replace the release reference. The last step of a publication.
+
+        A compare-and-swap store conditions the write on the version it last read and
+        raises ``ArtifactStoreConflictError`` when a concurrent publisher won — unless
+        the winning document is byte-identical, which reports success (idempotent
+        same-content publications must not conflict).
+        """
 
     @abstractmethod
     def read_state(self, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
@@ -87,13 +106,20 @@ class ArtifactStore(ABC):
 
     @abstractmethod
     def write_state(self, payload: dict[str, Any]) -> None:
-        """Atomically replace the auto-publish state."""
+        """Atomically replace the auto-publish state. Conflict semantics as ``write_ref``."""
 
     # --- coordination ---------------------------------------------------------
 
     @abstractmethod
     def publication_guard(self) -> AbstractContextManager[None]:
-        """Serialize publishers for this bundle across hosts."""
+        """
+        Serialize publishers for this bundle across hosts.
+
+        Either a real mutual-exclusion lock (the filesystem store's flock), or a no-op
+        for stores whose document writes are compare-and-swap — the caller's
+        read-reconcile-write steps inside the guard plus ``ArtifactStoreConflictError``
+        provide the equivalent safety.
+        """
 
     @abstractmethod
     def prepare_publish_areas(self) -> None:
@@ -158,4 +184,4 @@ class ArtifactStore(ABC):
         """Remove leftover temporary artifacts from earlier failed publications."""
 
 
-__all__ = ["ArtifactStore"]
+__all__ = ["ArtifactStore", "ArtifactStoreConflictError"]

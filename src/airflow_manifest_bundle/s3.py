@@ -139,9 +139,9 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         self.auto_publish = auto_publish
         if auto_publish and not self._store.supports_publication:
             raise TypeError(
-                "auto_publish requires a published_root that supports publication; an "
-                "object-store published_root is consume-only for now. Set auto_publish=False "
-                "or use a filesystem published_root."
+                "auto_publish requires a published_root that supports publication; the "
+                "configured published_root is consume-only. Set auto_publish=False or use "
+                "a published_root that publishers can write."
             )
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_object_key = (

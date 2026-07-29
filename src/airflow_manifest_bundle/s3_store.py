@@ -1,16 +1,22 @@
 """
-Read-only S3 artifact store: consume published bundle artifacts from an object store.
+S3 artifact store: publish and consume bundle artifacts in an object store.
 
 An S3 ``published_root`` (``s3://bucket/prefix``) holds the same logical layout as a
 filesystem one — ``versions/<bundle>/<version>/``, ``refs/<bundle>/latest.json``,
-``_state/<bundle>/auto-publish.json`` — with one object-store-specific rule: the
-embedded snapshot manifest object is written **last** during publication, so its
-presence is the commit marker. A version prefix without its manifest is invisible.
+``_state/<bundle>/auto-publish.json`` — with two object-store-specific rules:
 
-This store currently implements only the consume side (reference reads and snapshot
-materialization). Publication — conditional-write reference updates and manifest-last
-snapshot commits — lands separately; until then ``supports_publication`` stays False
-and adapters reject publish configurations against an object-store root.
+- The embedded snapshot manifest object is written **last** during publication, so
+  its presence is the commit marker. A version prefix without its manifest is
+  invisible, and re-publishing the same content completes it.
+- There is no cross-host lock. The two mutable documents are protected by
+  conditional writes (``If-Match``/``If-None-Match``); a lost race surfaces as
+  ``ArtifactStoreConflictError`` unless the winner wrote identical bytes, which is an
+  idempotent success. Snapshot uploads need no protection: content-addressed keys
+  make concurrent same-content publications write identical objects.
+
+Publication therefore requires an object store with conditional-write support (AWS
+S3 has it; some S3-compatible stores do not — those fail with a clear error on the
+first conditional write).
 """
 
 from __future__ import annotations
@@ -18,18 +24,22 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from airflow_manifest_bundle.bundle import (
     AUTO_PUBLISH_STATE_FILE_NAME,
     ManifestDagBundleBase,
+    _paths_overlap,
 )
 from airflow_manifest_bundle.manifest import (
     MANIFEST_FILE_NAME,
     BundleManifestError,
     BundleManifestNotFoundError,
+    BundleManifestSourceChangedError,
+    serialize_bundle_version_manifest,
 )
-from airflow_manifest_bundle.store import ArtifactStore
+from airflow_manifest_bundle.store import ArtifactStore, ArtifactStoreConflictError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,10 +54,15 @@ log = logging.getLogger(__name__)
 
 S3_PUBLISHED_ROOT_SCHEME = "s3://"
 
-_PUBLICATION_UNSUPPORTED_MESSAGE = (
-    "An object-store published_root does not support publication yet. Publish through "
-    "a filesystem published_root, or configure this bundle as consume-only."
+# HTTP 412 rejects a failed precondition; S3 returns 409 ConditionalRequestConflict
+# when concurrent conditional writes on one key race each other.
+_CONDITIONAL_WRITE_CONFLICT_CODES = frozenset(
+    {"PreconditionFailed", "412", "ConditionalRequestConflict", "409"}
 )
+_CONDITIONAL_WRITE_UNSUPPORTED_CODES = frozenset({"NotImplemented", "501"})
+
+#: CAS baseline recording that the document did not exist when last read.
+_MISSING = object()
 
 
 def _s3_error_code(error: Exception) -> str | None:
@@ -84,9 +99,9 @@ def parse_s3_published_root(published_root: str) -> tuple[str, str]:
 
 
 class S3ArtifactStore(ArtifactStore):
-    """Object-store artifact backend; consume-only until publication support lands."""
+    """Object-store artifact backend: CAS-coordinated publication, manifest-last commits."""
 
-    supports_publication = False
+    supports_publication = True
 
     def __init__(
         self,
@@ -109,6 +124,10 @@ class S3ArtifactStore(ArtifactStore):
         self.bucket_name, self._prefix = parse_s3_published_root(published_root)
         self.aws_conn_id = aws_conn_id if aws_conn_id is not None else S3Hook.default_conn_name
         self._s3_hook: Any | None = None
+        # CAS baselines for the mutable documents: key -> ETag from the last read or
+        # write, or _MISSING when the last read found no document. Absent means no
+        # baseline; the next write re-reads to establish one.
+        self._document_tokens: dict[str, Any] = {}
 
     # --- locators -------------------------------------------------------------
 
@@ -173,17 +192,24 @@ class S3ArtifactStore(ArtifactStore):
                 f"Could not create an S3 client for published_root {self.root}"
             ) from e
 
-    def _get_object_bytes(self, key: str) -> bytes | None:
-        """Return the object body, or None when the object does not exist."""
+    def _get_object(self, key: str) -> tuple[bytes, str | None] | None:
+        """Return (body, ETag) for the object, or None when it does not exist."""
         client = self._get_client()
         try:
             response = client.get_object(Bucket=self.bucket_name, Key=key)
             body = response["Body"]
-            return b"".join(iter(lambda: body.read(1024 * 1024), b""))
+            data = b"".join(iter(lambda: body.read(1024 * 1024), b""))
         except Exception as e:
             if _is_missing_s3_object_error(e):
                 return None
             raise self._read_error(key, e) from e
+        etag = response.get("ETag")
+        return data, (str(etag) if etag else None)
+
+    def _get_object_bytes(self, key: str) -> bytes | None:
+        """Return the object body, or None when the object does not exist."""
+        result = self._get_object(key)
+        return None if result is None else result[0]
 
     def _object_exists(self, key: str) -> bool:
         client = self._get_client()
@@ -208,9 +234,14 @@ class S3ArtifactStore(ArtifactStore):
     # --- mutable documents ----------------------------------------------------
 
     def _read_json_object(self, key: str, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
-        data = self._get_object_bytes(key)
-        if data is None:
+        result = self._get_object(key)
+        if result is None:
+            self._document_tokens[key] = _MISSING
             raise BundleManifestNotFoundError(missing_message)
+        data, etag = result
+        # Record the CAS baseline before parsing: a later write may deliberately
+        # replace a corrupt document.
+        self._record_document_token(key, etag)
         try:
             payload = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -218,6 +249,12 @@ class S3ArtifactStore(ArtifactStore):
         if not isinstance(payload, dict):
             raise BundleManifestError(invalid_message)
         return payload
+
+    def _record_document_token(self, key: str, etag: str | None) -> None:
+        if etag:
+            self._document_tokens[key] = etag
+        else:
+            self._document_tokens.pop(key, None)
 
     def read_ref(self, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
         return self._read_json_object(
@@ -230,24 +267,70 @@ class S3ArtifactStore(ArtifactStore):
         )
 
     def write_ref(self, payload: dict[str, Any]) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        self._write_json_document(self._ref_key, payload)
 
     def write_state(self, payload: dict[str, Any]) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        self._write_json_document(self._state_key, payload)
+
+    def _write_json_document(self, key: str, payload: dict[str, Any]) -> None:
+        token = self._document_tokens.get(key)
+        if token is None:
+            # No baseline from this session; establish one so the write stays CAS.
+            result = self._get_object(key)
+            token = result[1] if result is not None and result[1] else _MISSING
+            self._document_tokens[key] = token
+        body = serialize_bundle_version_manifest(payload)
+        conditional = {"IfNoneMatch": "*"} if token is _MISSING else {"IfMatch": token}
+        client = self._get_client()
+        try:
+            response = client.put_object(
+                Bucket=self.bucket_name, Key=key, Body=body, **conditional
+            )
+        except Exception as e:
+            code = _s3_error_code(e)
+            if code in _CONDITIONAL_WRITE_CONFLICT_CODES:
+                current = self._get_object(key)
+                if current is None:
+                    self._document_tokens[key] = _MISSING
+                else:
+                    self._record_document_token(key, current[1])
+                    if current[0] == body:
+                        # A concurrent publisher wrote identical bytes: idempotent win.
+                        return
+                raise ArtifactStoreConflictError(
+                    f"Another publisher updated {self._url(key)} concurrently"
+                ) from e
+            if code in _CONDITIONAL_WRITE_UNSUPPORTED_CODES:
+                raise BundleManifestError(
+                    f"The object store for published_root {self.root} does not support "
+                    "conditional writes, which publication requires. Use a store with "
+                    "If-Match support or publish through a filesystem published_root."
+                ) from e
+            raise self._write_error(key, e) from e
+        self._record_document_token(key, response.get("ETag"))
 
     # --- coordination ---------------------------------------------------------
 
+    @contextmanager
     def publication_guard(self):
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        # No cross-host lock exists for an object store. The mutable documents are
+        # compare-and-swap protected, and snapshot uploads are idempotent
+        # (content-addressed keys, manifest-last commit), so the guard is a no-op.
+        yield
 
     def prepare_publish_areas(self) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        """Nothing to create: object-store prefixes appear with their first object."""
 
     def prepare_state_area(self) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        """Nothing to create: object-store prefixes appear with their first object."""
 
     def validate_source_paths(self, source_path: Path, *, cache_versions_dir: Path) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        # The published root is remote, so only the local-cache overlap can occur.
+        if _paths_overlap(source_path, cache_versions_dir):
+            raise ValueError(
+                "source_path and Airflow's bundle cache must not overlap. Keep the Dag "
+                "source tree outside dag_bundle_storage_path."
+            )
 
     # --- snapshots ------------------------------------------------------------
 
@@ -332,10 +415,74 @@ class S3ArtifactStore(ArtifactStore):
         source_root: Path,
         validate_existing: Callable[[Path], None],
     ) -> bool:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        # ``validate_existing`` walks a filesystem tree; the object-store equivalent is
+        # comparing the committed manifest bytes — the manifest is content-addressed, so
+        # byte equality certifies the whole snapshot (consumers hash every file on fetch).
+        manifest_bytes = serialize_bundle_version_manifest(manifest)
+        manifest_key = self._snapshot_key(version, MANIFEST_FILE_NAME)
+        existing = self._get_object_bytes(manifest_key)
+        if existing is not None:
+            if existing != manifest_bytes:
+                raise BundleManifestError(
+                    f"Bundle snapshot manifest at {self._url(manifest_key)} does not match "
+                    f"the content-addressed version {version!r}; refusing to overwrite it"
+                )
+            return False
+
+        for file_info in manifest["files"]:
+            relative_path = ManifestDagBundleBase._validate_manifest_file_info(file_info)
+            source = source_root / relative_path
+            try:
+                data = source.read_bytes()
+            except FileNotFoundError as e:
+                raise BundleManifestSourceChangedError(
+                    f"Bundle source file disappeared while publishing bundle version "
+                    f"{version}: {relative_path}"
+                ) from e
+            # Hash what is actually uploaded so source drift between manifest
+            # construction and upload cannot commit a snapshot that contradicts its
+            # own content address (mirrors the filesystem store's inline check).
+            if (
+                len(data) != file_info["size"]
+                or hashlib.sha256(data).hexdigest() != file_info["sha256"]
+            ):
+                raise BundleManifestSourceChangedError(
+                    f"Bundle source changed while publishing bundle version {version}"
+                )
+            self._put_object(self._snapshot_key(version, *relative_path.split("/")), data)
+
+        # The manifest goes last: its presence commits the snapshot. Unconditional on
+        # purpose — same-content publishers write identical bytes, and overwriting a
+        # corrupt manifest with the correct one is self-healing.
+        self._put_object(manifest_key, manifest_bytes)
+        return True
+
+    def _put_object(self, key: str, body: bytes) -> None:
+        client = self._get_client()
+        try:
+            client.put_object(Bucket=self.bucket_name, Key=key, Body=body)
+        except Exception as e:
+            raise self._write_error(key, e) from e
+
+    def _write_error(self, key: str, error: Exception) -> BundleManifestError:
+        if _is_missing_s3_bucket_error(error):
+            return BundleManifestError(
+                f"S3 bucket {self.bucket_name!r} for published_root {self.root} does not "
+                "exist. Fix the published_root configuration before publishing."
+            )
+        return BundleManifestError(
+            f"Could not write {self._url(key)} to the object-store published_root"
+        )
 
     def sweep_publish_temps(self) -> None:
-        raise BundleManifestError(_PUBLICATION_UNSUPPORTED_MESSAGE)
+        """
+        Nothing to sweep: object-store publication writes no temporary artifacts.
+
+        Uploads land at their final content-addressed keys and the manifest object
+        commits the snapshot. A crash before the manifest PUT leaves an uncommitted
+        prefix that a later publication of the same content completes; reclaiming
+        abandoned prefixes is a deployment-side lifecycle concern.
+        """
 
 
 __all__ = [

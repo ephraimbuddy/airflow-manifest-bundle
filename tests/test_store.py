@@ -2,8 +2,9 @@
 Contract tests for ``ArtifactStore`` implementations.
 
 Every implementation must satisfy these behaviors; the tests talk only to the
-interface. When another backend lands (for example an S3 store), add it to the
-``store`` fixture parametrization instead of writing a parallel suite.
+interface, and the ``store`` fixture parametrizes them over every backend. Backend
+additions join that parametrization instead of writing a parallel suite; the few
+store-kind conditionals mark contract points that are deliberately backend-specific.
 """
 
 from __future__ import annotations
@@ -11,12 +12,17 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from _test_utils import conf_vars
 
+from airflow_manifest_bundle import bundle as bundle_module
 from airflow_manifest_bundle import s3_store as s3_store_module
-from airflow_manifest_bundle.bundle import FilesystemArtifactStore
+from airflow_manifest_bundle.bundle import (
+    BundleManifestReferenceChangedError,
+    FilesystemArtifactStore,
+)
 from airflow_manifest_bundle.local import (
     ManifestLocalDagBundle,
     publish_manifest_local_dag_bundle,
@@ -25,27 +31,42 @@ from airflow_manifest_bundle.manifest import (
     MANIFEST_FILE_NAME,
     BundleManifestError,
     BundleManifestNotFoundError,
+    BundleManifestSourceChangedError,
     build_bundle_version_manifest_result,
     serialize_bundle_version_manifest,
 )
 from airflow_manifest_bundle.s3_store import S3ArtifactStore, parse_s3_published_root
+from airflow_manifest_bundle.store import ArtifactStoreConflictError
 
 BUNDLE_NAME = "contract"
 BUCKET = "dag-bucket"
 
 
-# The S3 store cannot join this parametrization until it supports publication —
-# half of these contract tests publish. When it does, split the suite into
-# read-contract and publish-contract classes and parametrize both.
-@pytest.fixture(params=["filesystem"])
-def store(request, tmp_path):
+@pytest.fixture(params=["filesystem", "s3"])
+def store(request, tmp_path, fake_s3):
     if request.param == "filesystem":
         return FilesystemArtifactStore(
             bundle_name=BUNDLE_NAME,
             published_root=tmp_path / "published",
             cache_root=tmp_path / "cache",
         )
+    if request.param == "s3":
+        return S3ArtifactStore(
+            bundle_name=BUNDLE_NAME, published_root=f"s3://{BUCKET}/releases"
+        )
     raise ValueError(request.param)
+
+
+def _is_filesystem(store) -> bool:
+    return isinstance(store, FilesystemArtifactStore)
+
+
+def _corrupt_ref(store, fake_s3) -> None:
+    if _is_filesystem(store):
+        store.ref_path.parent.mkdir(parents=True, exist_ok=True)
+        store.ref_path.write_text("{not json")
+    else:
+        fake_s3.put(store._ref_key, b"{not json")
 
 
 def _write_source(root: Path) -> Path:
@@ -85,10 +106,9 @@ class TestDocuments:
         payload = store.read_ref(missing_message="missing", invalid_message="invalid")
         assert payload == {"schema_version": 1, "bundle_name": BUNDLE_NAME}
 
-    def test_read_ref_invalid_json_raises_with_message(self, store):
+    def test_read_ref_invalid_json_raises_with_message(self, store, fake_s3):
         store.prepare_publish_areas()
-        store.ref_path.parent.mkdir(parents=True, exist_ok=True)
-        store.ref_path.write_text("{not json")
+        _corrupt_ref(store, fake_s3)
         with pytest.raises(BundleManifestError, match="ref is invalid"):
             store.read_ref(missing_message="ref is gone", invalid_message="ref is invalid")
 
@@ -120,7 +140,9 @@ class TestSnapshots:
             destination,
             structural_validator=seen_trees.append,
         )
-        assert seen_trees, "structural validator must run before the transfer"
+        if _is_filesystem(store):
+            # Only backends with a walkable published tree run the pre-transfer pass.
+            assert seen_trees, "structural validator must run before the transfer"
         assert (destination / "dags" / "example.py").read_text() == "print('dag')\n"
         embedded = json.loads((destination / MANIFEST_FILE_NAME).read_text())
         assert embedded["version"] == result.version
@@ -138,7 +160,9 @@ class TestSnapshots:
             validate_existing=validated.append,
         )
         assert created_again is False
-        assert validated, "an existing snapshot must be validated, not rewritten"
+        if _is_filesystem(store):
+            # The object store validates by comparing committed manifest bytes instead.
+            assert validated, "an existing snapshot must be validated, not rewritten"
 
     def test_fetch_unpublished_version_raises_not_found(self, store, tmp_path):
         destination = tmp_path / "dest"
@@ -154,7 +178,14 @@ class TestSnapshots:
     def test_snapshot_exists_is_false_before_publication(self, store):
         assert store.snapshot_exists("sha256-" + "0" * 64) is False
 
-    def test_sweep_publish_temps_removes_orphans(self, store):
+    def test_sweep_publish_temps_removes_filesystem_orphans(self, tmp_path):
+        # Filesystem-specific: object-store publication writes no temporary artifacts,
+        # so its sweep is a documented no-op.
+        store = FilesystemArtifactStore(
+            bundle_name=BUNDLE_NAME,
+            published_root=tmp_path / "published",
+            cache_root=tmp_path / "cache",
+        )
         store.prepare_publish_areas()
         orphan_snapshot = store.snapshots_root / (".sha256-" + "0" * 64 + ".tmp123")
         orphan_snapshot.mkdir(parents=True)
@@ -176,11 +207,14 @@ class TestCoordination:
             pass
 
     def test_validate_source_paths_rejects_overlap(self, store, tmp_path):
+        cache_versions_dir = tmp_path / "cache" / "versions"
+        if _is_filesystem(store):
+            source = store.root / "source"
+        else:
+            # The published root is remote, so the cache overlap is the only local one.
+            source = cache_versions_dir / "source"
         with pytest.raises(ValueError):
-            store.validate_source_paths(
-                store.root / "source",
-                cache_versions_dir=tmp_path / "cache" / "versions",
-            )
+            store.validate_source_paths(source, cache_versions_dir=cache_versions_dir)
 
     def test_validate_source_paths_accepts_disjoint_source(self, store, tmp_path):
         source = _write_source(tmp_path / "elsewhere")
@@ -188,7 +222,7 @@ class TestCoordination:
 
     def test_locators_are_scoped_to_the_bundle(self, store):
         version = "sha256-" + "a" * 64
-        assert store.snapshot_path(version).name == version
+        assert str(store.snapshot_path(version)).endswith(f"/{version}")
         assert str(store.snapshots_root).startswith(str(store.root))
         assert str(store.ref_path).startswith(str(store.root))
         assert str(store.state_path).startswith(str(store.root))
@@ -211,25 +245,52 @@ class FakeStoreClientError(Exception):
 
 
 class FakeStoreS3Client:
-    """Just enough of the S3 API for the artifact store's read path."""
+    """Just enough of the S3 API for the artifact store, with conditional-write semantics."""
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.etags: dict[str, str] = {}
+        self.put_sequence: list[str] = []
+        self.put_conditions: list[tuple[str, str | None, str | None]] = []
+        self.fail_conditional_writes_with: str | None = None
+        self._etag_counter = 0
+
+    def _next_etag(self) -> str:
+        self._etag_counter += 1
+        return f'"etag-{self._etag_counter}"'
 
     def put(self, key: str, body: bytes) -> None:
+        """Test helper: an external writer that bypasses this client's bookkeeping."""
         self.objects[key] = body
+        self.etags[key] = self._next_etag()
 
     def get_object(self, *, Bucket: str, Key: str):
         assert Bucket == BUCKET
         if Key not in self.objects:
             raise FakeStoreClientError("NoSuchKey")
-        return {"Body": io.BytesIO(self.objects[Key]), "ETag": '"fake-etag"'}
+        return {"Body": io.BytesIO(self.objects[Key]), "ETag": self.etags.get(Key, '"fake-etag"')}
 
     def head_object(self, *, Bucket: str, Key: str):
         assert Bucket == BUCKET
         if Key not in self.objects:
             raise FakeStoreClientError("404")
-        return {"ContentLength": len(self.objects[Key]), "ETag": '"fake-etag"'}
+        return {"ContentLength": len(self.objects[Key]), "ETag": self.etags.get(Key, '"fake-etag"')}
+
+    def put_object(self, *, Bucket: str, Key: str, Body, IfMatch=None, IfNoneMatch=None):
+        assert Bucket == BUCKET
+        if (IfMatch or IfNoneMatch) and self.fail_conditional_writes_with:
+            raise FakeStoreClientError(self.fail_conditional_writes_with)
+        exists = Key in self.objects
+        if IfNoneMatch == "*" and exists:
+            raise FakeStoreClientError("PreconditionFailed")
+        if IfMatch is not None and (not exists or self.etags.get(Key) != IfMatch):
+            raise FakeStoreClientError("PreconditionFailed")
+        self.objects[Key] = Body if isinstance(Body, bytes) else Body.read()
+        etag = self._next_etag()
+        self.etags[Key] = etag
+        self.put_sequence.append(Key)
+        self.put_conditions.append((Key, IfMatch, IfNoneMatch))
+        return {"ETag": etag}
 
 
 @pytest.fixture
@@ -382,27 +443,6 @@ class TestS3StoreReadPath:
             store.fetch_snapshot(version, destination, structural_validator=lambda tree: None)
         assert not (tmp_path / "evil.py").exists()
 
-    def test_publication_operations_are_unsupported(self, fake_s3, tmp_path):
-        store = _s3_artifact_store()
-        operations = [
-            lambda: store.write_ref({}),
-            lambda: store.write_state({}),
-            lambda: store.publication_guard(),
-            lambda: store.prepare_publish_areas(),
-            lambda: store.prepare_state_area(),
-            lambda: store.validate_source_paths(tmp_path, cache_versions_dir=tmp_path / "v"),
-            lambda: store.publish_snapshot(
-                "sha256-" + "0" * 64,
-                manifest={},
-                source_root=tmp_path,
-                validate_existing=lambda tree: None,
-            ),
-            lambda: store.sweep_publish_temps(),
-        ]
-        for operation in operations:
-            with pytest.raises(BundleManifestError, match="does not support publication"):
-                operation()
-
     def test_locators_are_urls_scoped_to_the_root(self, fake_s3):
         store = _s3_artifact_store()
         version = "sha256-" + "a" * 64
@@ -410,6 +450,131 @@ class TestS3StoreReadPath:
         assert store.ref_path == f"s3://{BUCKET}/releases/refs/{BUNDLE_NAME}/latest.json"
         assert store.snapshot_path(version).endswith(f"/versions/{BUNDLE_NAME}/{version}")
         assert str(store.state_path).startswith(store.root)
+
+
+class TestS3StoreDocumentCAS:
+    def _ref_key(self) -> str:
+        return f"releases/refs/{BUNDLE_NAME}/latest.json"
+
+    def test_first_write_conditions_on_absence(self, fake_s3):
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        store.write_ref({"schema_version": 1})
+        assert fake_s3.put_conditions == [(self._ref_key(), None, "*")]
+
+    def test_write_without_prior_read_establishes_a_baseline(self, fake_s3):
+        store = _s3_artifact_store()
+        store.write_ref({"schema_version": 1})
+        assert fake_s3.put_conditions == [(self._ref_key(), None, "*")]
+
+    def test_replacement_conditions_on_the_read_etag(self, fake_s3):
+        fake_s3.put(self._ref_key(), b"{}")
+        expected_etag = fake_s3.etags[self._ref_key()]
+        store = _s3_artifact_store()
+        store.read_ref(missing_message="missing", invalid_message="invalid")
+        store.write_ref({"schema_version": 1})
+        assert fake_s3.put_conditions == [(self._ref_key(), expected_etag, None)]
+
+    def test_lost_create_race_with_different_content_conflicts(self, fake_s3):
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        fake_s3.put(self._ref_key(), b'{"winner":true}')
+        with pytest.raises(ArtifactStoreConflictError):
+            store.write_ref({"schema_version": 1})
+        # The conflict refreshed the baseline, so a retry replaces the winner cleanly.
+        store.write_ref({"schema_version": 2})
+        assert json.loads(fake_s3.objects[self._ref_key()]) == {"schema_version": 2}
+
+    def test_lost_race_with_identical_content_is_an_idempotent_win(self, fake_s3):
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        payload = {"schema_version": 1, "bundle_name": BUNDLE_NAME}
+        fake_s3.put(self._ref_key(), serialize_bundle_version_manifest(payload))
+        store.write_ref(payload)
+
+    def test_stale_baseline_conflicts_when_another_publisher_won(self, fake_s3):
+        fake_s3.put(self._ref_key(), b"{}")
+        store = _s3_artifact_store()
+        store.read_ref(missing_message="missing", invalid_message="invalid")
+        fake_s3.put(self._ref_key(), b'{"winner":true}')
+        with pytest.raises(ArtifactStoreConflictError):
+            store.write_ref({"schema_version": 1})
+
+    def test_missing_conditional_write_support_is_a_clear_error(self, fake_s3):
+        fake_s3.fail_conditional_writes_with = "NotImplemented"
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestError, match="does not support conditional writes"):
+            store.write_ref({"schema_version": 1})
+
+
+class TestS3StorePublishSnapshot:
+    def test_manifest_object_is_committed_last(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        store = _s3_artifact_store()
+        created = store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+        )
+        assert created is True
+        snapshot_puts = [key for key in fake_s3.put_sequence if f"/{result.version}/" in key]
+        assert snapshot_puts[-1].endswith(f"/{MANIFEST_FILE_NAME}")
+        assert len(snapshot_puts) == len(result.manifest["files"]) + 1
+
+    def test_republish_of_committed_version_uploads_nothing(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        store = _s3_artifact_store()
+        store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+        )
+        puts_after_first = len(fake_s3.put_sequence)
+        created = store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+        )
+        assert created is False
+        assert len(fake_s3.put_sequence) == puts_after_first
+
+    def test_tampered_committed_manifest_is_refused(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        fake_s3.put(
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/{MANIFEST_FILE_NAME}",
+            b'{"tampered": true}',
+        )
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestError, match="refusing to overwrite"):
+            store.publish_snapshot(
+                result.version,
+                manifest=result.manifest,
+                source_root=source,
+                validate_existing=lambda tree: None,
+            )
+
+    def test_source_drift_aborts_before_the_manifest_commits(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        (source / "dags" / "example.py").write_text("print('drifted')\n")
+        store = _s3_artifact_store()
+        with pytest.raises(BundleManifestSourceChangedError):
+            store.publish_snapshot(
+                result.version,
+                manifest=result.manifest,
+                source_root=source,
+                validate_existing=lambda tree: None,
+            )
+        assert store.snapshot_exists(result.version) is False
 
 
 def _version_string(version) -> str:
@@ -474,7 +639,106 @@ class TestBundleWithObjectStoreRoot:
             bundle.initialize()
             assert (bundle.path / "dags" / "example.py").read_text() == "print('dag')\n"
 
-    def test_source_path_rejected_with_object_store_root(self, fake_s3, tmp_path):
+    def test_auto_publish_local_source_to_object_store(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+                source_path=str(source),
+                source_stability_seconds=0,
+            )
+            bundle.initialize()
+            first_version = _version_string(bundle.get_current_version())
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('dag')\n"
+            ref = json.loads(fake_s3.objects["releases/refs/my-dags/latest.json"])
+            assert ref["version"] == first_version
+
+            (source / "dags" / "example.py").write_text("print('v2')\n")
+            bundle.refresh()
+            second_version = _version_string(bundle.get_current_version())
+            assert second_version != first_version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('v2')\n"
+            # The first release's objects stay published for pinned work.
+            assert f"releases/versions/my-dags/{first_version}/{MANIFEST_FILE_NAME}" in fake_s3.objects
+
+    def test_auto_publish_waits_for_shared_stability_over_object_store(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        initial = _publish_to_fake_s3(fake_s3, prefix="releases", bundle_name="my-dags", source=source)
+        (source / "dags" / "example.py").write_text("print('v2')\n")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+                source_path=str(source),
+                source_stability_seconds=30,
+            )
+            with mock.patch.object(bundle_module.time, "time", return_value=100):
+                bundle.refresh()
+            # Not stable yet: the current release stays active, the candidate is shared.
+            assert _version_string(bundle.get_current_version()) == initial.version
+            state = json.loads(fake_s3.objects["releases/_state/my-dags/auto-publish.json"])
+            assert state["first_observed_at"] == 100
+
+            with mock.patch.object(bundle_module.time, "time", return_value=130):
+                bundle.refresh()
+            assert _version_string(bundle.get_current_version()) != initial.version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('v2')\n"
+
+    def test_lost_release_race_follows_the_winner(self, fake_s3, tmp_path, monkeypatch):
+        source = _write_source(tmp_path / "source")
+        other_source = _write_source(tmp_path / "other")
+        (other_source / "dags" / "example.py").write_text("print('winner')\n")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+                source_path=str(source),
+                source_stability_seconds=0,
+            )
+            winner = {}
+            original_confirm = bundle._confirm_publish_source
+
+            def confirm_then_lose_the_race(prepared):
+                original_confirm(prepared)
+                # Another publisher commits a different release between this bundle's
+                # reference read and its conditional write.
+                if not winner:
+                    winner["result"] = _publish_to_fake_s3(
+                        fake_s3, prefix="releases", bundle_name="my-dags", source=other_source
+                    )
+
+            monkeypatch.setattr(bundle, "_confirm_publish_source", confirm_then_lose_the_race)
+            bundle.initialize()
+
+            assert _version_string(bundle.get_current_version()) == winner["result"].version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('winner')\n"
+
+    def test_explicit_publish_to_object_store(self, fake_s3, tmp_path):
+        source = _write_source(tmp_path / "source")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"s3://{BUCKET}/releases",
+            )
+            result = publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+            assert result.created_snapshot is True
+            assert str(result.manifest_ref_path) == f"s3://{BUCKET}/releases/refs/my-dags/latest.json"
+
+            bundle.refresh()
+            assert _version_string(bundle.get_current_version()) == result.version
+
+            with pytest.raises(BundleManifestReferenceChangedError):
+                publish_manifest_local_dag_bundle(
+                    bundle=bundle,
+                    source_path=source,
+                    expected_current_version="sha256-" + "0" * 64,
+                )
+
+    def test_consume_only_guard_still_protects_against_non_publishing_stores(
+        self, fake_s3, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(S3ArtifactStore, "supports_publication", False)
         with (
             conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
             pytest.raises(TypeError, match="consume-only"),
@@ -484,34 +748,6 @@ class TestBundleWithObjectStoreRoot:
                 published_root=f"s3://{BUCKET}/releases",
                 source_path=str(tmp_path / "source"),
             )
-
-    def test_s3_bundle_auto_publish_rejected_with_object_store_root(self, fake_s3, tmp_path):
-        from airflow_manifest_bundle.s3 import ManifestS3DagBundle
-
-        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
-            with pytest.raises(TypeError, match="consume-only"):
-                ManifestS3DagBundle(
-                    name="my-dags",
-                    bucket_name="source-bucket",
-                    published_root=f"s3://{BUCKET}/releases",
-                )
-            bundle = ManifestS3DagBundle(
-                name="my-dags",
-                bucket_name="source-bucket",
-                published_root=f"s3://{BUCKET}/releases",
-                auto_publish=False,
-            )
-            assert bundle._has_publish_source is False
-
-    def test_explicit_publish_rejected_with_object_store_root(self, fake_s3, tmp_path):
-        source = _write_source(tmp_path / "source")
-        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
-            bundle = ManifestLocalDagBundle(
-                name="my-dags",
-                published_root=f"s3://{BUCKET}/releases",
-            )
-            with pytest.raises(BundleManifestError, match="does not support publication"):
-                publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
 
     def test_published_root_conn_id_reaches_the_hook(self, fake_s3, tmp_path):
         source = _write_source(tmp_path / "source")

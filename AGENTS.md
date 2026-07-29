@@ -23,7 +23,8 @@ safety argument.
 - `src/airflow_manifest_bundle/local.py` — local source adapter.
 - `src/airflow_manifest_bundle/s3.py` — read-only S3 source and local mirror adapter.
 - `src/airflow_manifest_bundle/s3_store.py` — S3 implementation of the store contract
-  for an `s3://` published_root (consume-only until object-store publication lands).
+  for an `s3://` published_root: conditional-write (CAS) documents, manifest-last
+  snapshot commits.
 - `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.

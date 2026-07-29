@@ -43,7 +43,7 @@ from airflow_manifest_bundle.manifest import (
     serialize_bundle_version_manifest,
     verify_bundle_version_manifest,
 )
-from airflow_manifest_bundle.store import ArtifactStore
+from airflow_manifest_bundle.store import ArtifactStore, ArtifactStoreConflictError
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     :param published_root: Root containing published snapshots and the current release
         reference: a shared filesystem path, or an ``s3://bucket/prefix`` URL for an
-        object-store root (consume-only until object-store publication lands).
+        object-store root (publication there requires conditional-write support).
     :param published_root_conn_id: Optional connection for an object-store
         ``published_root``. Invalid for filesystem roots.
     :param source_stability_seconds: How long source metadata must remain unchanged
@@ -351,6 +351,18 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         """Publish a stable source change without disrupting an existing release."""
         try:
             return self._publish_from_source_if_ready(current_ref)
+        except ArtifactStoreConflictError:
+            # A CAS store lost the release-reference race to another publisher. Follow
+            # the winning release; if our source still disagrees, the next refresh
+            # observes and republishes it.
+            fallback_ref = self._read_current_manifest_ref_or_none() or current_ref
+            if fallback_ref is None:
+                raise
+            log.info(
+                "Another publisher updated bundle '%s' concurrently; following its release.",
+                self.name,
+            )
+            return fallback_ref
         except BundleManifestSourceChangedError:
             fallback_ref = current_ref or self._read_current_manifest_ref_or_none()
             if fallback_ref is None:
@@ -593,7 +605,24 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
                 source_signature=prepared.source_signature,
                 first_observed_at=now,
             )
-            self._write_auto_publish_candidate_state(state)
+            try:
+                self._write_auto_publish_candidate_state(state)
+            except ArtifactStoreConflictError:
+                # A CAS store lost the candidate race to another replica. Adopt the
+                # winner: a matching candidate keeps its earlier shared timestamp, and
+                # a different one correctly reads as "the source is not stable yet".
+                current = self._read_auto_publish_candidate_state_or_none()
+                if current is None:
+                    raise
+                if (
+                    current.source_type != prepared.source_type
+                    or current.source_identity != prepared.source_identity
+                ):
+                    raise BundleManifestError(
+                        f"Automatic publishers for bundle '{self.name}' do not use the same "
+                        f"{prepared.source_type} source"
+                    ) from None
+                return current
         return state
 
     def _auto_publish_candidate_remains_ready_locked(
@@ -1574,11 +1603,17 @@ def publish_prepared_manifest_dag_bundle(
             prepared=prepared_source,
             target_version=manifest_result.version,
         )
-        return _publish_manifest_result(
-            bundle=bundle,
-            manifest_result=manifest_result,
-            prepared_source=prepared_source,
-        )
+        try:
+            return _publish_manifest_result(
+                bundle=bundle,
+                manifest_result=manifest_result,
+                prepared_source=prepared_source,
+            )
+        except ArtifactStoreConflictError as e:
+            raise BundleManifestReferenceChangedError(
+                f"Bundle '{bundle.name}' manifest reference changed during publication: "
+                "another publisher updated the release concurrently"
+            ) from e
 
 
 def _publish_manifest_result(

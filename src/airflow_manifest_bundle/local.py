@@ -31,9 +31,9 @@ class ManifestLocalDagBundle(ManifestDagBundleBase):
         if self.source_path is not None:
             if not self._store.supports_publication:
                 raise TypeError(
-                    "source_path requires a published_root that supports publication; an "
-                    "object-store published_root is consume-only for now. Remove source_path "
-                    "or use a filesystem published_root."
+                    "source_path requires a published_root that supports publication; the "
+                    "configured published_root is consume-only. Remove source_path or use "
+                    "a published_root that publishers can write."
                 )
             try:
                 self._store.validate_source_paths(
