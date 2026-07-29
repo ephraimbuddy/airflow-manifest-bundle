@@ -42,7 +42,7 @@ This document uses each term below with one meaning only.
 | S3 folder | The mutable set of S3 objects below one bucket and prefix. |
 | S3 mirror | A disposable local copy of the current S3 folder. Airflow does not parse it. |
 | Source observation | The identity of one source state. |
-| Deployment marker | An optional S3 object that a deployment tool writes last. |
+| Deployment marker | An optional S3 object below the source prefix. A deployment tool writes a new value to it last. |
 | Published root | The shared folder that holds all publications. Its path is the `published_root` option. |
 | Snapshot | One immutable, read-only copy of the source tree in the published root. |
 | Manifest | A JSON file that lists each file of a snapshot with its hash, size, and executable flag. |
@@ -256,7 +256,8 @@ For an S3 source, `deployment_marker_key` gives a stronger release boundary. The
 deployment tool writes this object after all Dag objects are ready. The adapter reads
 the marker before and after the object inventory. It excludes the marker from the
 manifest. A changed Dag inventory cannot replace a current release until the marker
-also changes.
+also changes. When the configuration sets this option, the object is required. The
+deployment marker is not a Marker.
 
 All automatic-publisher hosts must have synchronized clocks. If a host reads a
 candidate timestamp that is in the future, it waits and writes a warning.
