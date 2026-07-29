@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from airflow_manifest_bundle._compat import remove_bundle_tree_forcefully
 from airflow_manifest_bundle.bundle import (
     BundleManifestRef,
+    FilesystemArtifactStore,
     ManifestDagBundleBase,
     PreparedPublishSource,
     _write_json_atomically,
@@ -137,6 +138,22 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         self.max_file_size_bytes = max_file_size_bytes
         self.max_total_size_bytes = max_total_size_bytes
         self.auto_publish = auto_publish
+        if auto_publish and not self._store.supports_publication:
+            raise TypeError(
+                "auto_publish requires a published_root that supports publication; the "
+                "configured published_root is consume-only. Set auto_publish=False or use "
+                "a published_root that publishers can write."
+            )
+        # Advisory for dag processors and publisher hosts only: pinned bundles are
+        # constructed for every task, and workers never publish.
+        if self.version is None and isinstance(self._store, FilesystemArtifactStore):
+            log.info(
+                "Bundle '%s' reads its Dag source from S3 but publishes releases to the "
+                "filesystem published_root %s. An s3:// published_root removes the shared "
+                "filesystem; see the S3 operator guide.",
+                self.name,
+                self.published_root,
+            )
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_object_key = (
             _join_s3_key(self._normalized_prefix, deployment_marker_key)
@@ -222,6 +239,20 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         }
         if observation.marker_signature is not None:
             release_source_metadata["deployment_marker"] = observation.marker_signature
+        # Transport hints for an object-store published_root: each observed object,
+        # pinned to its ETag, so the store can server-side copy instead of uploading
+        # the mirror bytes. Optimization only — any hint may fail back to upload.
+        endpoint = getattr(getattr(client, "meta", None), "endpoint_url", None)
+        copy_hints = {
+            entry.relative_path: {
+                "type": "s3",
+                "endpoint": endpoint if isinstance(endpoint, str) else None,
+                "bucket": self.bucket_name,
+                "key": entry.key,
+                "etag": entry.etag,
+            }
+            for entry in observation.entries
+        }
         return PreparedPublishSource(
             root=self.s3_dags_dir,
             source_snapshot=snapshot,
@@ -231,6 +262,7 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
             file_sha256_by_path=file_sha256_by_path,
             confirmation_data=observation,
             release_source_metadata=release_source_metadata,
+            copy_hints=copy_hints,
         )
 
     def _publish_from_source_if_ready(

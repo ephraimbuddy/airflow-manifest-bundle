@@ -77,8 +77,10 @@ dag_bundle_config_list = [
   ]
 ```
 
-For S3, keep the same authoritative local `published_root` and replace only the
-source adapter:
+For S3, replace the source adapter. The recommended `published_root` for an S3
+source is an `s3://` prefix — the Dag source, the immutable releases, and the
+coordination state all live in the object store, and no host needs a shared
+filesystem:
 
 ```ini
 [dag_processor]
@@ -89,7 +91,7 @@ dag_bundle_config_list = [
       "kwargs": {
         "bucket_name": "airflow-dags",
         "prefix": "dags/",
-        "published_root": "/shared/dag-releases",
+        "published_root": "s3://airflow-dags/releases",
         "refresh_interval": 30,
         "deployment_marker_key": ".ready"
       }
@@ -98,10 +100,35 @@ dag_bundle_config_list = [
 ```
 
 `aws_conn_id` is optional and defaults to `aws_default`, as it does for Airflow's
-stock `S3DagBundle`. The S3 adapter lists and reads objects. It never writes to S3.
-It mirrors the folder into disposable local staging, but Airflow never parses or
-executes that mirror. See the [S3 operator guide](docs/s3.md) for IAM, deployment
-markers, storage, and recovery.
+stock `S3DagBundle`. The S3 adapter lists and reads objects. It never writes to the
+Dag source; publishers write only the releases prefix. It mirrors the folder into
+disposable local staging, but Airflow never parses or executes that mirror. See the
+[S3 operator guide](docs/s3.md) for the IAM matrix, deployment markers, retention
+lifecycle rules, and Object Lock guidance.
+
+With an object-store `published_root`, workers read only the releases prefix, and
+coordination uses conditional writes instead of a lock file — AWS S3 supports them;
+an S3-compatible store without `If-Match` support fails publication with a clear
+error. The optional `published_root_conn_id` selects a separate AWS connection for
+the artifact store; it defaults to the store's standard connection resolution and is
+invalid for filesystem roots. When the source and the releases prefix share an S3
+endpoint, publication uses server-side copies and moves no file content through the
+dag processor.
+
+A filesystem `published_root` remains supported for the S3 adapter as the fallback
+for two situations: workers that must run without any cloud credentials (they read
+only the shared path), and object stores without conditional-write support. It
+reintroduces the shared-filesystem requirement that the `s3://` mode removes:
+
+```ini
+"kwargs": {
+  "bucket_name": "airflow-dags",
+  "prefix": "dags/",
+  "published_root": "/shared/dag-releases",
+  "refresh_interval": 30,
+  "deployment_marker_key": ".ready"
+}
+```
 
 S3 automatic publication is enabled by default. Set `"auto_publish": false` when a
 deployment pipeline runs `publish-s3` and dag processors must only consume explicit
@@ -131,8 +158,8 @@ Keep these locations separate and non-overlapping:
 
 - **the Dag source** — a mutable local tree or S3 folder, read by the selected publisher
 - **the S3 mirror** — disposable per-host staging used only by the S3 adapter
-- **`published_root`** — the authoritative publication area, a shared filesystem path
-  writable by publishers and readable by all Airflow components
+- **`published_root`** — the authoritative publication area: a shared filesystem path
+  or an `s3://` prefix, writable by publishers and readable by all Airflow components
 - **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
 
 Airflow always parses and executes the immutable snapshot, never the mutable source
@@ -224,9 +251,14 @@ versions/my_dags/sha256-<hex>/            immutable snapshot (read-only, world-r
     <your dag files>
     .airflow-bundle-manifest.json         full manifest embedded in the snapshot
 refs/my_dags/latest.json                  compact release reference — updated last, atomically
-_locks/my_dags.lock                       cross-host publication lock
+_locks/my_dags.lock                       cross-host publication lock (filesystem roots)
 _state/my_dags/auto-publish.json          shared stability candidate (automatic mode)
 ```
+
+An object-store `published_root` uses the same layout under its prefix, with two
+differences: there is no `_locks/` entry — the reference and candidate documents are
+protected by conditional writes instead — and the embedded manifest object is
+written last, so its presence commits the snapshot.
 
 The release reference changes only after the snapshot is complete and verified. If
 automatic publication fails after an earlier release exists, the bundle logs the
@@ -263,7 +295,9 @@ Each command reads the named bundle from Airflow configuration, creates or valid
 the content-addressed snapshot, and updates the release reference last. Neither needs
 the Airflow metadata database. The local publishing host needs read access to the
 source and write access to `published_root`. The S3 publishing host needs read-only
-S3 access plus write access to its local mirror and `published_root`.
+access to the Dag source plus write access to its local mirror and `published_root`
+— for an object-store root, that means `PutObject` on the releases prefix while the
+source prefix stays read-only.
 
 Use `--expected-current-version sha256-<hex>` after the first release to stop an
 older deployment from replacing a newer one. Omit that option for the first release,
@@ -284,15 +318,19 @@ source stability period. Explicit publication waits for its command. Both workfl
 publish an immutable snapshot and atomically move the release reference. Airflow
 continues to serve the previous release until publication succeeds.
 
-Publication is idempotent, atomic, and serialized by the shared lock under
-`published_root`. A deployment pipeline can deliver the source tree for automatic
-publication, or it can run an explicit publisher command. Neither workflow needs
-access to the Airflow metadata database.
+Publication is idempotent and atomic, and concurrent publishers are safe: a
+filesystem `published_root` serializes them through the shared lock, and an
+object-store root coordinates them with conditional writes — a publisher that loses
+the release race follows the winning release instead of overwriting it.
+A deployment pipeline can deliver the source tree for automatic publication, or it
+can run an explicit publisher command. Neither workflow needs access to the Airflow
+metadata database.
 
 **Retention**: Airflow never deletes from `published_root` — pruning old
-`versions/<bundle>/sha256-*` directories is a deliberate operation you schedule
-yourself, and it must keep any version that a Dag run can still request (retries,
-reruns, deferred tasks, callbacks pin by version).
+`versions/<bundle>/sha256-*` entries is a deliberate operation you schedule
+yourself (a lifecycle rule on the releases prefix, for an object-store root), and it
+must keep any version that a Dag run can still request (retries, reruns, deferred
+tasks, callbacks pin by version).
 
 ## Verify a deployment
 
@@ -356,8 +394,15 @@ what core actually does at runtime:
   explicit local and S3 publication use the `airflow-manifest-bundle` console script.
 - **Shared automatic-publisher coordination.** Airflow can run successive refreshes
   in different dag-processor replicas, so the stability candidate lives under
-  `published_root`, protected by the publication lock. Only the confirmed-source
-  hashing optimization remains process-local.
+  `published_root`, protected by the publication lock (filesystem roots) or by
+  conditional writes (object-store roots). Only the confirmed-source hashing
+  optimization remains process-local.
+- **Pluggable artifact store.** All published-artifact access goes through one
+  internal contract (`store.py`); the filesystem and S3 implementations differ only
+  in coordination primitives (flock versus conditional writes) and commit mechanics
+  (atomic rename versus manifest-last object writes). Every fetched file is
+  hash-verified against the manifest either way, so a misbehaving backend fails
+  closed at materialization.
 
 Known caveat: Airflow's task startup takes the bundle version lock only after
 `bundle.initialize()`, so a stale-cleanup race can remove a version mid-initialization;

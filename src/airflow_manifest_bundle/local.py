@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 from airflow_manifest_bundle.bundle import (
     ManifestDagBundleBase,
     PreparedPublishSource,
-    _validate_publish_paths,
     publish_prepared_manifest_dag_bundle,
 )
 from airflow_manifest_bundle.manifest import (
@@ -30,11 +29,15 @@ class ManifestLocalDagBundle(ManifestDagBundleBase):
         super().__init__(**kwargs)
         self.source_path = Path(source_path) if source_path else None
         if self.source_path is not None:
+            if not self._store.supports_publication:
+                raise TypeError(
+                    "source_path requires a published_root that supports publication; the "
+                    "configured published_root is consume-only. Remove source_path or use "
+                    "a published_root that publishers can write."
+                )
             try:
-                _validate_publish_paths(
-                    source_path=self.source_path,
-                    published_root=self.published_root,
-                    versions_dir=self.versions_dir,
+                self._store.validate_source_paths(
+                    self.source_path, cache_versions_dir=self.versions_dir
                 )
             except ValueError as e:
                 # Stock callback preparation treats ValueError as "bundle removed".

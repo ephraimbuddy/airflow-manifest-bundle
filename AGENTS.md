@@ -15,10 +15,16 @@ safety argument.
 
 - `src/airflow_manifest_bundle/manifest.py` — content-addressing core: hashing, manifest
   schema, validation. Shared by all (current and future) backends.
+- `src/airflow_manifest_bundle/store.py` — the `ArtifactStore` contract: every access
+  to published references, auto-publish state, and snapshots goes through it.
 - `src/airflow_manifest_bundle/bundle.py` — common publication, reference, immutable
-  snapshot, cache, and validation lifecycle.
+  snapshot, cache, and validation lifecycle; also home of `FilesystemArtifactStore`,
+  which implements the store contract with this file's filesystem helpers.
 - `src/airflow_manifest_bundle/local.py` — local source adapter.
 - `src/airflow_manifest_bundle/s3.py` — read-only S3 source and local mirror adapter.
+- `src/airflow_manifest_bundle/s3_store.py` — S3 implementation of the store contract
+  for an `s3://` published_root: conditional-write (CAS) documents, manifest-last
+  snapshot commits.
 - `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
