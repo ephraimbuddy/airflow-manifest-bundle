@@ -16,7 +16,7 @@ from typing import Any
 
 try:
     from airflow.dag_processing.bundles.base import BundleVersion
-except ImportError:  # Airflow 3.1/3.2: get_current_version returns a plain string
+except ImportError:  # Airflow 3.0-3.2: get_current_version returns a plain string
     BundleVersion = None  # type: ignore[assignment,misc]
 
 
@@ -25,7 +25,7 @@ def make_bundle_version(version: str) -> Any:
     Return ``version`` in the form the installed Airflow expects.
 
     Airflow 3.3+ expects a ``BundleVersion`` (a bare string from a versioned bundle
-    triggers a deprecation warning); 3.1/3.2 only know plain strings. The ``data``
+    triggers a deprecation warning); 3.0-3.2 only know plain strings. The ``data``
     field stays None — the content-hash version string is the whole contract.
     """
     if BundleVersion is not None:

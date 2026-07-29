@@ -36,7 +36,7 @@ safety argument.
 ## Commands
 
 ```bash
-uv venv && uv pip install "apache-airflow==3.3.0" pytest -e .   # or 3.1.8
+uv venv && uv pip install "apache-airflow==3.3.0" pytest -e .   # or 3.0.6
 .venv/bin/python -m pytest -q            # full suite, ~3s
 uvx ruff==0.16.0 check src tests scripts # lint
 uv build && uvx twine check dist/*       # packaging sanity
@@ -48,10 +48,12 @@ non-editable on purpose — it validates the packaged wheel — so do not "fix" 
 
 ## Invariants — do not break these
 
-1. **Stock Airflow 3.1+ only.** Never import an Airflow symbol without confirming it
-   exists in Airflow 3.1.8. Version-dependent behavior goes in `_compat.py`
-   (see `make_bundle_version`: `BundleVersion` object on 3.3+, plain string earlier).
-   Verify changes against both ends of the support range; CI runs 3.1.8 and 3.3.0.
+1. **Stock Airflow 3.0+ only.** Never import an Airflow symbol without confirming it
+   exists in Airflow 3.0.6, and never touch an optional base-class attribute without
+   a `getattr` guard (see `view_url_template`: `_view_url_template` arrived in
+   3.1.0). Version-dependent behavior goes in `_compat.py` (see
+   `make_bundle_version`: `BundleVersion` object on 3.3+, plain string earlier).
+   Verify changes against both ends of the support range; CI runs 3.0.6 and 3.3.0.
 2. **Version strings are `sha256-<hex>` and must stay filesystem-safe.** Airflow core
    builds cache, lock, and tracking paths from the raw version string.
 3. **Error contract.** Every entry point Airflow calls (`initialize`, `refresh`,

@@ -427,12 +427,16 @@ For an S3 published root, OS users and file modes do not apply. The permissions 
 
 ## 13. Compatibility
 
-The package operates on Apache Airflow 3.1 and later. The package examines the
+The package operates on Apache Airflow 3.0 and later. The package examines the
 installed Airflow at import time:
 
 - On Airflow 3.3 and later, `get_current_version()` returns a `BundleVersion` object.
-- On Airflow 3.1 and 3.2, it returns the version as a string, because those releases
-  know only strings.
+- On Airflow 3.0 through 3.2, it returns the version as a string, because those
+  releases know only strings.
+- Airflow 3.0 does not set the view-URL template attribute on bundles; the S3
+  adapter examines it with a safe default.
+- On Airflow 3.0, callbacks run in the Dag processor with its bundle path. The
+  callback behaviors in section 10.5 apply to Airflow 3.1 and later.
 
 The S3 adapter requires `apache-airflow-providers-amazon` 9.10.0 or later. The
 `s3` optional dependency supplies this provider. The base package and local adapter

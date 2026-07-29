@@ -294,7 +294,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     def get_current_version(self) -> Any:
         """
-        Current version: a ``BundleVersion`` on Airflow 3.3+, a plain string on 3.1/3.2.
+        Current version: a ``BundleVersion`` on Airflow 3.3+, a plain string on 3.0-3.2.
 
         The version string alone is the whole contract: it is the content hash of the
         snapshot's manifest entries, so a pinned snapshot is self-certifying and no
