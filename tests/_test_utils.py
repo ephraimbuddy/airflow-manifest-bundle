@@ -16,8 +16,11 @@ def published_payload(cli_output: str) -> dict:
     heuristic. The payload is the last block whose line is exactly ``{``.
     """
     lines = cli_output.splitlines()
-    start = max(index for index, line in enumerate(lines) if line == "{")
-    return json.loads("\n".join(lines[start:]))
+    starts = [index for index, line in enumerate(lines) if line == "{"]
+    # Fail with the captured output: a missing payload means the command itself
+    # failed, and that output is what diagnoses it.
+    assert starts, f"no JSON payload found in CLI output:\n{cli_output}"
+    return json.loads("\n".join(lines[starts[-1] :]))
 
 
 @contextmanager
