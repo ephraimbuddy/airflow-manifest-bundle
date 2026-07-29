@@ -98,8 +98,8 @@ class BundlePublishResult:
     bundle_name: str
     version: str
     ref_payload: dict[str, Any]
-    version_path: Path
-    manifest_ref_path: Path
+    version_path: Path | str
+    manifest_ref_path: Path | str
     manifest_sha256: str
     file_count: int
     total_size: int
@@ -137,7 +137,11 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
     Concrete adapters prepare a local source tree for automatic publication. Airflow
     only parses immutable, validated copies from ``versions_dir``.
 
-    :param published_root: Shared root containing published snapshots and the current release reference.
+    :param published_root: Root containing published snapshots and the current release
+        reference: a shared filesystem path, or an ``s3://bucket/prefix`` URL for an
+        object-store root (consume-only until object-store publication lands).
+    :param published_root_conn_id: Optional connection for an object-store
+        ``published_root``. Invalid for filesystem roots.
     :param source_stability_seconds: How long source metadata must remain unchanged
         before automatic publication. Defaults to ``refresh_interval``. Set to zero
         only when the deployment process updates the source atomically.
@@ -156,6 +160,7 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
         self,
         *,
         published_root: str | None = None,
+        published_root_conn_id: str | None = None,
         source_stability_seconds: float | None = None,
         allow_empty_source: bool = False,
         **kwargs,
@@ -167,11 +172,24 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             # callbacks with a misleading log. TypeError matches how any bundle class fails
             # on a bad config kwarg.
             raise TypeError("published_root must be provided")
-        self._store: ArtifactStore = FilesystemArtifactStore(
-            bundle_name=self.name,
-            published_root=Path(published_root),
-            cache_root=get_bundle_storage_root_path(),
-        )
+        if str(published_root).startswith("s3://"):
+            from airflow_manifest_bundle.s3_store import S3ArtifactStore
+
+            self._store: ArtifactStore = S3ArtifactStore(
+                bundle_name=self.name,
+                published_root=str(published_root),
+                aws_conn_id=published_root_conn_id,
+            )
+        else:
+            if published_root_conn_id is not None:
+                raise TypeError(
+                    "published_root_conn_id is only valid with an object-store published_root"
+                )
+            self._store = FilesystemArtifactStore(
+                bundle_name=self.name,
+                published_root=Path(published_root),
+                cache_root=get_bundle_storage_root_path(),
+            )
         if source_stability_seconds is None:
             source_stability_seconds = float(self.refresh_interval)
         if (
@@ -1495,6 +1513,11 @@ def publish_prepared_manifest_dag_bundle(
     expected_current_version: str | None = None,
 ) -> BundlePublishResult:
     """Publish one prepared local tree as an immutable manifest-backed snapshot."""
+    if not bundle._store.supports_publication:
+        raise BundleManifestError(
+            f"Bundle '{bundle.name}' cannot publish: its published_root does not support "
+            "publication yet. Publish through a filesystem published_root instead."
+        )
     source_path = prepared_source.root
     bundle._store.validate_source_paths(source_path, cache_versions_dir=bundle.versions_dir)
     if not prepared_source.source_snapshot.files and not bundle.allow_empty_source:

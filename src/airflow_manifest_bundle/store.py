@@ -40,30 +40,35 @@ class ArtifactStore(ABC):
 
     bundle_name: str
 
+    #: Whether publishers can write releases through this store. A store that is
+    #: consume-only (for now, the object-store read path) keeps this False so
+    #: adapters can reject publish configurations at construction time.
+    supports_publication: bool = True
+
     # --- locators -------------------------------------------------------------
 
     @property
     @abstractmethod
-    def root(self) -> Path:
+    def root(self) -> Path | str:
         """The published root this store manages."""
 
     @property
     @abstractmethod
-    def ref_path(self) -> Path:
+    def ref_path(self) -> Path | str:
         """Locator of the release reference document."""
 
     @property
     @abstractmethod
-    def state_path(self) -> Path:
+    def state_path(self) -> Path | str:
         """Locator of the auto-publish state document."""
 
     @property
     @abstractmethod
-    def snapshots_root(self) -> Path:
+    def snapshots_root(self) -> Path | str:
         """Locator of the published snapshots area for this bundle."""
 
     @abstractmethod
-    def snapshot_path(self, version: str) -> Path:
+    def snapshot_path(self, version: str) -> Path | str:
         """Locator of one published snapshot."""
 
     # --- mutable documents ----------------------------------------------------

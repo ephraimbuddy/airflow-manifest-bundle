@@ -137,6 +137,12 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
         self.max_file_size_bytes = max_file_size_bytes
         self.max_total_size_bytes = max_total_size_bytes
         self.auto_publish = auto_publish
+        if auto_publish and not self._store.supports_publication:
+            raise TypeError(
+                "auto_publish requires a published_root that supports publication; an "
+                "object-store published_root is consume-only for now. Set auto_publish=False "
+                "or use a filesystem published_root."
+            )
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_object_key = (
             _join_s3_key(self._normalized_prefix, deployment_marker_key)
