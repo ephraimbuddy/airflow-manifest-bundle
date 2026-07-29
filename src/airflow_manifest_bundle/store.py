@@ -20,8 +20,8 @@ Contract notes for implementations:
   safe against concurrent publishers (a filesystem lock, or compare-and-swap
   semantics that surface conflicts as ``BundleManifestError``).
 - Snapshots are immutable once committed and must not become visible half-written.
-- Locator properties currently return ``Path`` because the only implementation is
-  filesystem-backed; they will widen to string locators when an object store lands.
+- Locator properties return ``Path`` for the filesystem store and string URLs for
+  object stores; callers must not apply Path-only operations to them.
 """
 
 from __future__ import annotations

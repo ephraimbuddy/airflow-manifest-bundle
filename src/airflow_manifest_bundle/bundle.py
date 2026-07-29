@@ -228,21 +228,22 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
 
     # The published-artifact layout is owned by the store; these accessors keep the
     # public attribute surface (used by adapters, the CLI, and operators inspecting
-    # a deployment) stable across the extraction of ``ArtifactStore``.
+    # a deployment) stable across the extraction of ``ArtifactStore``. They are
+    # ``Path`` for a filesystem root and string URLs for an object-store root.
     @property
-    def published_root(self) -> Path:
+    def published_root(self) -> Path | str:
         return self._store.root
 
     @property
-    def manifest_ref_path(self) -> Path:
+    def manifest_ref_path(self) -> Path | str:
         return self._store.ref_path
 
     @property
-    def published_versions_dir(self) -> Path:
+    def published_versions_dir(self) -> Path | str:
         return self._store.snapshots_root
 
     @property
-    def auto_publish_state_path(self) -> Path:
+    def auto_publish_state_path(self) -> Path | str:
         return self._store.state_path
 
     @property
