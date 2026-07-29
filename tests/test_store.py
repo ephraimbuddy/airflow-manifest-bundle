@@ -843,6 +843,88 @@ class TestBundleWithObjectStoreRoot:
             assert _version_string(bundle.get_current_version()) != initial.version
             assert (bundle.path / "dags" / "example.py").read_text() == "print('v2')\n"
 
+    def _external_candidate(self, source: Path, *, signature: str | None = None) -> bytes:
+        from airflow_manifest_bundle.local import _local_source_identity
+        from airflow_manifest_bundle.manifest import collect_bundle_source_snapshot
+
+        return json.dumps(
+            {
+                "schema_version": 2,
+                "bundle_name": "my-dags",
+                "source_type": "local",
+                "source_identity": _local_source_identity(source),
+                "source_signature": signature or collect_bundle_source_snapshot(source).signature,
+                "first_observed_at": 50.0,
+            }
+        ).encode()
+
+    def _bundle_losing_candidate_race(self, fake_s3, tmp_path):
+        """A bundle whose changed source needs 30s of stability, plus its initial release."""
+        source = _write_source(tmp_path / "source")
+        initial = _publish_to_fake_s3(fake_s3, prefix="releases", bundle_name="my-dags", source=source)
+        (source / "dags" / "example.py").write_text("print('v2')\n")
+        bundle = ManifestLocalDagBundle(
+            name="my-dags",
+            published_root=f"s3://{BUCKET}/releases",
+            source_path=str(source),
+            source_stability_seconds=30,
+        )
+        return bundle, initial, source
+
+    def _inject_candidate_race(self, bundle, fake_s3, monkeypatch, candidate: bytes) -> None:
+        """Write an external candidate between the bundle's state read and its CAS write."""
+        raced = {}
+        original_confirm = bundle._confirm_publish_source
+
+        def confirm_then_lose_the_race(prepared):
+            original_confirm(prepared)
+            if not raced:
+                raced["done"] = True
+                fake_s3.put("releases/_state/my-dags/auto-publish.json", candidate)
+
+        monkeypatch.setattr(bundle, "_confirm_publish_source", confirm_then_lose_the_race)
+
+    def test_lost_candidate_race_adopts_a_matching_winner(self, fake_s3, tmp_path, monkeypatch):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, initial, source = self._bundle_losing_candidate_race(fake_s3, tmp_path)
+            # The winner observed the same source 50 seconds before our clock reads 100.
+            self._inject_candidate_race(
+                bundle, fake_s3, monkeypatch, self._external_candidate(source)
+            )
+            with mock.patch.object(bundle_module.time, "time", return_value=100):
+                bundle.refresh()
+
+            # The adopted shared timestamp already satisfied the window: one refresh
+            # published without restarting the stability period.
+            assert _version_string(bundle.get_current_version()) != initial.version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('v2')\n"
+
+    def test_lost_candidate_race_to_a_different_observation_stays_unpublished(
+        self, fake_s3, tmp_path, monkeypatch
+    ):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle, initial, source = self._bundle_losing_candidate_race(fake_s3, tmp_path)
+            self._inject_candidate_race(
+                bundle,
+                fake_s3,
+                monkeypatch,
+                self._external_candidate(source, signature="sha256:someone-elses-view"),
+            )
+            with mock.patch.object(bundle_module.time, "time", return_value=100):
+                bundle.refresh()
+
+            # A winner with a different observation must not satisfy our window: using
+            # its timestamp would publish a source that never proved stable.
+            assert _version_string(bundle.get_current_version()) == initial.version
+
+            # The next quiet cycles record a fresh candidate and publish normally.
+            with mock.patch.object(bundle_module.time, "time", return_value=200):
+                bundle.refresh()
+            assert _version_string(bundle.get_current_version()) == initial.version
+            with mock.patch.object(bundle_module.time, "time", return_value=230):
+                bundle.refresh()
+            assert _version_string(bundle.get_current_version()) != initial.version
+
     def test_lost_release_race_follows_the_winner(self, fake_s3, tmp_path, monkeypatch):
         source = _write_source(tmp_path / "source")
         other_source = _write_source(tmp_path / "other")

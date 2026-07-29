@@ -614,13 +614,16 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
             try:
                 self._write_auto_publish_candidate_state(state)
             except ArtifactStoreConflictError:
-                # A CAS store lost the candidate race to another replica. Adopt the
-                # winner: a matching candidate keeps its earlier shared timestamp, and
-                # a different one correctly reads as "the source is not stable yet".
+                # A CAS store lost the candidate race to another replica. This method
+                # must only ever return a candidate that matches ``prepared`` — the
+                # caller measures the stability window against it — so adopt the
+                # winner only when it recorded the same observation (keeping its
+                # earlier shared timestamp). Any other outcome is "the candidate
+                # changed": not stable, try again next refresh.
                 current = self._read_auto_publish_candidate_state_or_none()
-                if current is None:
-                    raise
-                if (
+                if current is not None and self._candidate_matches(current, prepared):
+                    return current
+                if current is not None and (
                     current.source_type != prepared.source_type
                     or current.source_identity != prepared.source_identity
                 ):
@@ -628,7 +631,9 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
                         f"Automatic publishers for bundle '{self.name}' do not use the same "
                         f"{prepared.source_type} source"
                     ) from None
-                return current
+                raise BundleManifestSourceChangedError(
+                    "Bundle source stability candidate changed before automatic publication"
+                ) from None
         return state
 
     def _auto_publish_candidate_remains_ready_locked(
