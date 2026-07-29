@@ -257,7 +257,7 @@ deployment tool writes this object after all Dag objects are ready. The adapter 
 the marker before and after the object inventory. It excludes the marker from the
 manifest. A changed Dag inventory cannot replace a current release until the marker
 also changes. When the configuration sets this option, the object is required. The
-deployment marker is not the cache validation marker.
+deployment marker is not a Marker.
 
 All automatic-publisher hosts must have synchronized clocks. If a host reads a
 candidate timestamp that is in the future, it waits and writes a warning.
