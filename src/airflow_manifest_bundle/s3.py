@@ -144,7 +144,9 @@ class ManifestS3DagBundle(ManifestDagBundleBase):
                 "configured published_root is consume-only. Set auto_publish=False or use "
                 "a published_root that publishers can write."
             )
-        if isinstance(self._store, FilesystemArtifactStore):
+        # Advisory for dag processors and publisher hosts only: pinned bundles are
+        # constructed for every task, and workers never publish.
+        if self.version is None and isinstance(self._store, FilesystemArtifactStore):
             log.info(
                 "Bundle '%s' reads its Dag source from S3 but publishes releases to the "
                 "filesystem published_root %s. An s3:// published_root removes the shared "

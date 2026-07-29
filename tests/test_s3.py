@@ -182,6 +182,16 @@ def test_filesystem_published_root_logs_the_fallback_hint(tmp_path, monkeypatch,
 
     assert "s3:// published_root removes the shared filesystem" in caplog.text
 
+    # Pinned bundles are constructed for every task; workers must not see the hint.
+    caplog.clear()
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        caplog.at_level("INFO", logger="airflow_manifest_bundle.s3"),
+    ):
+        _bundle(tmp_path, version="sha256-" + "0" * 64)
+
+    assert "s3:// published_root removes the shared filesystem" not in caplog.text
+
 
 def test_prepare_publish_source_populates_copy_hints(tmp_path, monkeypatch):
     client = FakeS3Client()
