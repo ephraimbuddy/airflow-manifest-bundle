@@ -43,7 +43,8 @@ This document uses each term below with one meaning only.
 | S3 mirror | A disposable local copy of the current S3 folder. Airflow does not parse it. |
 | Source observation | The identity of one source state. |
 | Deployment marker | An optional S3 object below the source prefix. A deployment tool writes a new value to it last. |
-| Published root | The shared folder that holds all publications. Its path is the `published_root` option. |
+| Published root | The location that holds all publications: a shared folder, or an S3 location (`s3://bucket/prefix`). Its value is the `published_root` option. |
+| Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. |
 | Snapshot | One immutable, read-only copy of the source tree in the published root. |
 | Manifest | A JSON file that lists each file of a snapshot with its hash, size, and executable flag. |
 | Release reference | The file `refs/<bundle>/latest.json`. It points to the current snapshot. |
@@ -56,12 +57,16 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has six modules:
+The package has eight modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
-- `bundle.py` — contains `ManifestDagBundleBase` and the common artifact lifecycle.
+- `store.py` — defines the artifact-store contract. All access to the published
+  root goes through this contract.
+- `bundle.py` — contains `ManifestDagBundleBase`, the common artifact lifecycle,
+  and the filesystem artifact store.
 - `local.py` — contains the local source adapter, `ManifestLocalDagBundle`.
 - `s3.py` — contains the S3 source adapter, `ManifestS3DagBundle`.
+- `s3_store.py` — contains the S3 artifact store for an `s3://` published root.
 - `cli.py` — contains the explicit publisher commands.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
@@ -69,6 +74,12 @@ The package has six modules:
 Both source adapters inherit directly from `ManifestDagBundleBase`. Neither source
 adapter inherits from the other. The common class does not import the Amazon
 provider.
+
+The source adapter and the artifact store are independent selections. The source
+adapter supplies the Dag files. The artifact store keeps the published artifacts.
+The `published_root` value selects the artifact store: a filesystem path selects
+the filesystem store, and an `s3://` URL selects the S3 store. Each source adapter
+can publish to each artifact store.
 
 Airflow finds a bundle through its configuration. The classpath is
 `airflow_manifest_bundle.local.ManifestLocalDagBundle` or
@@ -83,9 +94,14 @@ versions/<bundle>/sha256-<hex>/           one snapshot for each version
     <dag files>
     .airflow-bundle-manifest.json         the manifest of this snapshot
 refs/<bundle>/latest.json                 the release reference
-_locks/<bundle>.lock                      the publication lock
+_locks/<bundle>.lock                      the publication lock (filesystem roots only)
 _state/<bundle>/auto-publish.json         the candidate state for automatic publication
 ```
+
+An S3 published root holds the same structure below its prefix, without `_locks/`.
+Conditional writes protect the release reference and the candidate state there. The
+publisher writes the manifest object last. The manifest object commits the
+snapshot. A version prefix without its manifest object is not a release.
 
 Airflow writes cache copies to `<dag_bundle_storage_path>/<bundle>/versions/<version>/`.
 The S3 adapter writes its mirror to
@@ -114,9 +130,11 @@ Each source adapter ignores these items: `.git`, `__pycache__`, files with the
 
 A source adapter returns a prepared source. Automatic publication first completes
 the source stability check. The explicit publisher commands do not do this check.
-The common publisher makes the manifest from the prepared local tree. The publisher
-then gets the publication lock. Other publishers wait for the publication lock. The
-publisher reads the release reference again. It then does these steps:
+The common publisher makes the manifest from the prepared local tree. For a
+filesystem published root, the publisher then gets the publication lock, and other
+publishers wait for it. For an S3 published root, there is no lock; section 8.2
+gives the differences. The publisher reads the release reference again. It then
+does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
    snapshot does not exist, it copies each file into a temporary folder, checks each
@@ -165,7 +183,35 @@ The `--expected-current-version` option stops an old deployment from replacing a
 newer release. Each command can write its result as text or JSON. Each command
 rejects a bundle that has automatic publication enabled.
 
-An explicit S3 publisher needs read access to S3. It does not need S3 write access.
+An explicit S3 publisher needs read access to the Dag source. It does not need
+write access to the Dag source. For an S3 published root, it needs write access to
+the releases prefix; section 12 gives the permissions.
+
+### 8.2 Publication to an S3 published root
+
+An S3 published root has no lock. The procedure keeps the same steps, with these
+differences:
+
+1. The store uploads each file to its final key below the version prefix. It hashes
+   each file before the upload and compares the result with the manifest. It writes
+   the manifest object last. The manifest object commits the snapshot. When the
+   source and the published root use the same S3 endpoint, the store copies each
+   object on the server side, with a condition on the observed object state. If a
+   copy fails, the store uploads the prepared local file instead.
+2. A write to the release reference or to the candidate state has a condition: the
+   document must be unchanged since the last read by this store. When another
+   publisher changed the document first, the store reports a conflict. A concurrent
+   write of the same bytes is not a conflict; the result is already correct.
+3. On a release-reference conflict, the publisher that lost the race follows the
+   release of the winner. It does not overwrite that release. On a candidate-state
+   conflict, the publisher adopts the winner only when the winner recorded the same
+   source observation. The stability period never uses the timestamp of a different
+   observation.
+
+The same properties hold: idempotent, atomic, and safe with concurrent publishers.
+Publication requires conditional writes (`If-Match` and `If-None-Match`) from the
+object store. AWS S3 supports them. A store without them stops the first
+publication with a clear error. Consumption does not need conditional writes.
 
 ## 9. Automatic publication
 
@@ -362,8 +408,22 @@ the published root.
 
 An explicit publisher must have write access to its bundle folders in the published
 root. An S3 publisher also needs write access to its local mirror. It needs
-`s3:ListBucket` and `s3:GetObject` for the source prefix. It does not need S3 write
-access. An explicit-mode Dag processor and a pinned S3 bundle need no S3 permission.
+`s3:ListBucket` and `s3:GetObject` for the source prefix. It does not need write
+access to the Dag source. With a filesystem published root, an explicit-mode Dag
+processor and a pinned S3 bundle need no S3 permission.
+
+For an S3 published root, OS users and file modes do not apply. The permissions are:
+
+- A publisher needs `s3:PutObject` and `s3:GetObject` on the releases prefix. The
+  Dag source prefix stays read-only.
+- A pinned bundle and a consume-only Dag processor need `s3:GetObject` on the
+  releases prefix, and no other S3 permission.
+- Read access to the source prefix by the store's principal permits server-side
+  copies. Without it, the store uploads each file. Both paths give a correct
+  snapshot.
+- The optional `published_root_conn_id` option selects the AWS connection of the
+  artifact store. Workers give the best results with credentials from the default
+  AWS chain, because bundle initialization runs before task context.
 
 ## 13. Compatibility
 
@@ -405,6 +465,12 @@ versions. An incompatible change to a file format must use a new schema version.
   version that Airflow can request.
 - Clock differences between automatic-publisher hosts can delay publication. A host
   does not publish when the shared candidate timestamp is in its future.
+- Publication to an S3 published root requires conditional writes. Some
+  S3-compatible stores do not have them. Consumption operates without them.
+- A publication to an S3 published root can stop before the manifest write. This
+  leaves an uncommitted version prefix. Consumers do not see it. A later
+  publication of the same content completes it. An age-based lifecycle rule can
+  remove abandoned prefixes.
 
 ## 15. Backend extension
 
@@ -420,6 +486,15 @@ The package is one family: manifest bundles. Each source adapter is one module.
   Both current source adapters publish local filesystem artifacts. Optional source
   metadata records the source adapter type, source identity, source observation, and
   deployment marker observation.
+
+The artifact store is a second extension point. `store.py` defines the contract.
+The filesystem store and the S3 store implement it. A new artifact store implements
+the same operations with the atomicity primitives of its backend. Two rules are
+mandatory. First, writes to the release reference and to the candidate state need
+protection from concurrent publishers: a lock, or conditional writes. Second, a
+snapshot must not become visible before it is complete. Consumers hash each fetched
+file against the manifest, so a store defect stops materialization; it cannot
+produce a wrong cache copy.
 
 The local-only installation stays small: an optional-dependency group pulls a cloud
 SDK only when the operator asks for that backend.
