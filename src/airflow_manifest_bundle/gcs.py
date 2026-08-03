@@ -225,7 +225,8 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
             endpoint = getattr(client_options, "api_endpoint", None)
         if not isinstance(endpoint, str) or not endpoint:
             return None
-        if endpoint.rstrip("/") == GCS_PUBLIC_API_ENDPOINT:
+        endpoint = endpoint.rstrip("/")
+        if endpoint == GCS_PUBLIC_API_ENDPOINT:
             return None
         return endpoint
 
