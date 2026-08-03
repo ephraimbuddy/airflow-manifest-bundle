@@ -43,6 +43,7 @@ airflow-manifest-bundle = "airflow_manifest_bundle.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+gcs = ["apache-airflow-providers-google>=18.1.0"]
 s3 = ["apache-airflow-providers-amazon>=9.10.0"]
 
 [tool.hatch.build.targets.wheel]

@@ -4,15 +4,15 @@
 
 This document gives the design of the airflow-manifest-bundle package. The package
 supplies manifest Dag bundles for Apache Airflow. Each bundle reads immutable Dag
-snapshots from a shared filesystem. A source adapter can read a local folder or an
-S3 folder. This document tells you what the parts are, how they operate, and why the
-design is safe.
+snapshots from a published root. A source adapter can read a local folder, an S3
+folder, or a GCS folder. This document tells you what the parts are, how they operate,
+and why the design is safe.
 
 ## 2. Problem
 
-Airflow includes the `LocalDagBundle` and `S3DagBundle` classes. These classes read
-Dag files from mutable locations. The files can change at all times. These locations
-have no recoverable version.
+Airflow includes the `LocalDagBundle`, `S3DagBundle`, and `GCSDagBundle` classes.
+These classes read Dag files from mutable locations. The files can change at all
+times. These locations have no recoverable version.
 
 When a task runs again, Airflow cannot find the files that the first run used. A
 deployment on a shared filesystem cannot run a task again with the same files. Git is
@@ -23,7 +23,7 @@ one solution, but not all deployments can use Git.
 The package divides "a change to a file" from "a deployment". A source adapter
 prepares one local source tree. A common publisher writes an immutable snapshot of
 the Dag files. The bundle can run the publisher as part of each refresh. An operator
-can also run a local or S3 publisher command. Airflow reads only published
+can also run a local, S3, or GCS publisher command. Airflow reads only published
 snapshots. A change to a source file has no effect until a publication.
 
 The version of each snapshot is a hash of its content. Airflow keeps this version
@@ -41,8 +41,10 @@ This document uses each term below with one meaning only.
 | Source tree | The mutable local folder that contains the Dag files. |
 | S3 folder | The mutable set of S3 objects below one bucket and prefix. |
 | S3 mirror | A disposable local copy of the current S3 folder. Airflow does not parse it. |
+| GCS folder | The mutable set of GCS objects below one bucket and prefix. |
+| GCS mirror | A disposable local copy of the current GCS folder. Airflow does not parse it. |
 | Source observation | The identity of one source state. |
-| Deployment marker | An optional S3 object below the source prefix. A deployment tool writes a new value to it last. |
+| Deployment marker | An optional object below a cloud source prefix. A deployment tool writes a new value to it last. |
 | Published root | The location that holds all publications: a shared folder, or an S3 location (`s3://bucket/prefix`). Its value is the `published_root` option. |
 | Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. |
 | Snapshot | One immutable, read-only copy of the source tree in the published root. |
@@ -57,7 +59,7 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has eight modules:
+The package has ten modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
 - `store.py` — defines the artifact-store contract. All access to the published
@@ -65,25 +67,33 @@ The package has eight modules:
 - `bundle.py` — contains `ManifestDagBundleBase`, the common artifact lifecycle,
   and the filesystem artifact store.
 - `local.py` — contains the local source adapter, `ManifestLocalDagBundle`.
+- `object_source.py` — contains `ObjectStoreSourceDagBundleBase`, the shared
+  object-store source machinery: source observation, the local mirror and its
+  state, mirror safety validation, and publication confirmation.
 - `s3.py` — contains the S3 source adapter, `ManifestS3DagBundle`.
+- `gcs.py` — contains the GCS source adapter, `ManifestGCSDagBundle`.
 - `s3_store.py` — contains the S3 artifact store for an `s3://` published root.
 - `cli.py` — contains the explicit publisher commands.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
 
-Both source adapters inherit directly from `ManifestDagBundleBase`. Neither source
-adapter inherits from the other. The common class does not import the Amazon
-provider.
+The local source adapter inherits directly from `ManifestDagBundleBase`. The cloud
+source adapters inherit from `ObjectStoreSourceDagBundleBase`, which holds every
+safety property they share; an adapter supplies only its storage client, listing,
+marker read, and pinned download. No source adapter inherits from another source
+adapter. The common classes do not import a cloud provider.
 
 The source adapter and the artifact store are independent selections. The source
 adapter supplies the Dag files. The artifact store keeps the published artifacts.
-The `published_root` value selects the artifact store: a filesystem path selects
-the filesystem store, and an `s3://` URL selects the S3 store. Each source adapter
-can publish to each artifact store.
+The `published_root` value selects the artifact store. A filesystem path selects the
+filesystem store. An `s3://` URL selects the S3 store. The local and S3 source
+adapters can publish to each artifact store. The GCS source adapter accepts only the
+filesystem store; it rejects an object-store `published_root` at construction.
 
 Airflow finds a bundle through its configuration. The classpath is
-`airflow_manifest_bundle.local.ManifestLocalDagBundle` or
-`airflow_manifest_bundle.s3.ManifestS3DagBundle`. No plugin is necessary.
+`airflow_manifest_bundle.local.ManifestLocalDagBundle`,
+`airflow_manifest_bundle.s3.ManifestS3DagBundle`, or
+`airflow_manifest_bundle.gcs.ManifestGCSDagBundle`. No plugin is necessary.
 
 ## 6. Storage layout
 
@@ -107,10 +117,13 @@ Airflow writes cache copies to `<dag_bundle_storage_path>/<bundle>/versions/<ver
 The S3 adapter writes its mirror to
 `<dag_bundle_storage_path>/<bundle>/_s3_source/`. It writes mirror state to
 `<dag_bundle_storage_path>/<bundle>/_s3_source_state.json`.
+The GCS adapter writes its mirror to
+`<dag_bundle_storage_path>/<bundle>/_gcs_source/`. It writes mirror state to
+`<dag_bundle_storage_path>/<bundle>/_gcs_source_state.json`.
 
 Keep the source, the published root, the mirror, and the cache copies in different
 locations. The bundle refuses a local configuration in which these locations touch.
-The S3 mirror is a safe child of the Airflow bundle base folder.
+Each cloud-source mirror is a safe child of the Airflow bundle base folder.
 
 ## 7. Version identity
 
@@ -141,7 +154,7 @@ does these steps:
    copy against the manifest, and then moves the folder into position with one
    atomic rename.
 2. It asks the source adapter to confirm the prepared source. The local adapter reads
-   local metadata. The S3 adapter reads the remote observation and local mirror
+   local metadata. Each cloud adapter reads the remote observation and local mirror
    metadata. If the source changed, the publisher stops with an error.
 3. It writes the release reference to a temporary file, then replaces `latest.json`
    with one atomic rename.
@@ -170,22 +183,28 @@ An S3 bundle can set `auto_publish` to `false`. An operator can then run this co
 airflow-manifest-bundle publish-s3 <bundle-name>
 ```
 
+A GCS bundle can set `auto_publish` to `false`. An operator can then run this command:
+
+```text
+airflow-manifest-bundle publish-gcs <bundle-name>
+```
+
 Each command reads the Airflow bundle configuration. The local command publishes
-the specified source tree. The S3 command reads the configured bucket and prefix.
-It writes a disposable mirror in the Airflow bundle cache. It holds the Airflow
-bundle lock until the final source confirmation is complete.
+the specified source tree. Each cloud command reads its configured bucket and prefix.
+It writes a disposable mirror in the Airflow bundle cache. It holds the Airflow bundle
+lock until the final source confirmation is complete.
 
 The explicit command is the deployment boundary. It does not use candidate state or
 the source stability period. The deployment tool must complete the source delivery
-before it runs the command. An S3 deployment marker gives a stronger boundary.
+before it runs the command. A cloud deployment marker gives a stronger boundary.
 
 The `--expected-current-version` option stops an old deployment from replacing a
 newer release. Each command can write its result as text or JSON. Each command
 rejects a bundle that has automatic publication enabled.
 
-An explicit S3 publisher needs read access to the Dag source. It does not need
+An explicit cloud publisher needs read access to the Dag source. It does not need
 write access to the Dag source. For an S3 published root, it needs write access to
-the releases prefix; section 12 gives the permissions.
+the releases prefix. Section 12 gives the permissions.
 
 ### 8.2 Publication to an S3 published root
 
@@ -215,9 +234,10 @@ publication with a clear error. Consumption does not need conditional writes.
 
 ## 9. Automatic publication
 
-A local `source_path` enables automatic local publication. The default S3
-configuration enables automatic S3 publication. An S3 bundle can set `auto_publish`
-to `false` to disable it. An unpinned automatic refresh does these steps:
+A local `source_path` enables automatic local publication. The default S3 and GCS
+configurations enable automatic cloud publication. A cloud bundle can set
+`auto_publish` to `false` to disable it. An unpinned automatic refresh does these
+steps:
 
 1. It reads the current release reference.
 2. It asks the source adapter for a prepared source and a source signature.
@@ -252,18 +272,36 @@ validated inventory. It uses the Airflow bundle lock to protect one host's mirro
 It compares the remote inventory before and after a mirror change. It writes mirror
 state only after this comparison and a structural check.
 
-The adapter rejects a source that has more than 10,000 files. It rejects a file that
-is larger than 100 MiB. It rejects a source that is larger than 1 GiB. The
+Each cloud adapter rejects a source that has more than 10,000 files. It rejects a
+file that is larger than 100 MiB. It rejects a source that is larger than 1 GiB. The
 `max_file_count`, `max_file_size_bytes`, and `max_total_size_bytes` options can
 change these limits.
 
 A new process checks the SHA-256 value of each reused mirror file. A mismatch makes
-the adapter download the file again. After the process confirms the source and its
-snapshot, an unchanged refresh checks metadata only.
+the cloud adapter download the file again. After the process confirms the source and
+its snapshot, an unchanged refresh checks metadata only.
 
 The S3 source identity contains the endpoint identity, bucket, and normalized prefix.
 It does not contain `aws_conn_id` or credentials. The shared candidate state rejects
 a different source identity for the same bundle.
+
+For a GCS source, the source signature contains a canonical object inventory. Each
+entry contains the relative path, object name, size, generation, metageneration,
+updated value, and ETag. The generation identifies the exact remote object data. It
+is not an artifact hash. The publisher uses its own SHA-256 value from the downloaded
+bytes for artifact identity.
+
+The GCS adapter applies the same path checks and source limits as the S3 adapter. It
+downloads the observed generation with a generation-match condition. It compares the
+remote inventory before and after a mirror change. It writes mirror state only after
+this comparison and a structural check.
+
+The GCS source identity contains the endpoint identity, bucket, and normalized prefix.
+It does not contain `gcp_conn_id` or credentials. The endpoint identity of the default
+public endpoint is a stable null value: the adapter reads the endpoint from library
+internals on a best-effort basis, so a client-library change must not change the
+identity of a default deployment. Only a configured custom endpoint differentiates.
+The shared candidate state rejects a different source identity for the same bundle.
 
 The candidate state is an atomic, schema-versioned coordination hint in the
 published root. It does not select a release. The release reference is the only file
@@ -298,7 +336,7 @@ can still leave an incomplete source unchanged for that period. For a local sour
 the deployment tool can prepare a separate source tree and replace the active source
 tree with one atomic rename.
 
-For an S3 source, `deployment_marker_key` gives a stronger release boundary. The
+For an S3 or GCS source, `deployment_marker_key` gives a stronger release boundary. The
 deployment tool writes this object after all Dag objects are ready. The adapter reads
 the marker before and after the object inventory. It excludes the marker from the
 manifest. A changed Dag inventory cannot replace a current release until the marker
@@ -314,10 +352,11 @@ candidate timestamp that is in the future, it waits and writes a warning.
 
 The Dag processor calls `refresh()` on an interval. The bundle reads the release
 reference. If the bundle has an automatic publication source, it first runs the
-automatic publication procedure. The automatic S3 adapter prepares its mirror under
-the Airflow bundle lock. An explicit S3 bundle does not read S3 during refresh. If a
-validated cache copy of the current version exists, the bundle uses it without a
-lock. If the cache copy does not exist, the bundle makes one under the bundle lock.
+automatic publication procedure. Each automatic cloud adapter prepares its mirror
+under the Airflow bundle lock. An explicit cloud bundle does not read its source
+during refresh. If a validated cache copy of the current version exists, the bundle
+uses it without a lock. If the cache copy does not exist, the bundle makes one under
+the bundle lock.
 
 ### 10.2 Creation of a cache copy
 
@@ -340,6 +379,10 @@ published root. The snapshot proves its own identity: its manifest must hash to 
 pinned version.
 
 A pinned S3 bundle does not make an S3 hook. It does not check a bucket, list a
+prefix, read a mirror, read candidate state, or read the release reference. It needs
+only the pinned version and the published root.
+
+A pinned GCS bundle does not make a GCS hook. It does not check a bucket, list a
 prefix, read a mirror, read candidate state, or read the release reference. It needs
 only the pinned version and the published root.
 
@@ -379,6 +422,12 @@ exception types can stop the processor. Thus:
 - The S3 adapter uses `BundleManifestNotFoundError` when a bucket or required
   deployment marker does not exist. It uses `BundleManifestSourceChangedError` when
   two source observations differ.
+- The GCS adapter changes Google credentials, access, endpoint, timeout, service, and
+  download errors into `BundleManifestError`.
+- The GCS adapter uses `BundleManifestNotFoundError` when a bucket, a configured
+  prefix with no objects, or a required deployment marker does not exist. It uses
+  `BundleManifestSourceChangedError` when two source observations differ or a
+  generation condition fails.
 
 If these errors occur in automatic publication, the bundle keeps the current release.
 If no current release exists, the error stays visible to Airflow.
@@ -412,6 +461,11 @@ root. An S3 publisher also needs write access to its local mirror. It needs
 access to the Dag source. With a filesystem published root, an explicit-mode Dag
 processor and a pinned S3 bundle need no S3 permission.
 
+A GCS publisher also needs write access to its local mirror. It needs
+`storage.buckets.get`, `storage.objects.list`, and `storage.objects.get` for the
+source. It does not need write access to the Dag source. With a filesystem published
+root, an explicit-mode Dag processor and a pinned GCS bundle need no GCS permission.
+
 For an S3 published root, OS users and file modes do not apply. The permissions are:
 
 - A publisher needs `s3:PutObject` and `s3:GetObject` on the releases prefix. The
@@ -433,8 +487,8 @@ installed Airflow at import time:
 - On Airflow 3.3 and later, `get_current_version()` returns a `BundleVersion` object.
 - On Airflow 3.0 through 3.2, it returns the version as a string, because those
   releases know only strings.
-- Airflow 3.0 does not set the view-URL template attribute on bundles; the S3
-  adapter examines it with a safe default.
+- Airflow 3.0 does not set the view-URL template attribute on bundles. The S3 and GCS
+  adapters examine it with a safe default.
 - On Airflow 3.0, callbacks run in the Dag processor with its bundle path. The
   callback behaviors in section 10.5 apply to Airflow 3.1 and later.
 
@@ -442,6 +496,11 @@ The S3 adapter requires `apache-airflow-providers-amazon` 9.10.0 or later. The
 `s3` optional dependency supplies this provider. The base package and local adapter
 can operate without it. An S3 class import also stays safe without the provider. An
 unpinned S3 source operation gives an error that names the optional dependency.
+
+The GCS adapter requires `apache-airflow-providers-google` 18.1.0 or later. The
+`gcs` optional dependency supplies this provider. The base package and local adapter
+can operate without it. A GCS class import also stays safe without the provider. An
+unpinned GCS source operation gives an error that names the optional dependency.
 
 The files on disk define compatibility between bundle processes. The release
 reference, manifest, and candidate state contain a `schema_version` field. Bundle
@@ -460,13 +519,16 @@ versions. An incompatible change to a file format must use a new schema version.
   runs, deferred tasks, and callbacks point to versions.
 - An automatic refresh reads the metadata of each source file. A new process also
   waits for the stability period and hashes the unchanged source one time.
-- An automatic S3 refresh reads the remote object inventory. An explicit S3 command
-  does the same. A mirror change needs a second inventory and object downloads.
+- An automatic cloud refresh reads the remote object inventory. An explicit cloud
+  command does the same. A mirror change needs a second inventory and object downloads.
 - The stability period cannot prove that a source delivery is complete. Atomic source
-  replacement gives stronger local protection. An S3 deployment marker gives a
-  stronger S3 boundary.
-- The S3 mirror is not a historical store. The published root must retain every
-  version that Airflow can request.
+  replacement gives stronger local protection. A cloud deployment marker gives a
+  stronger cloud-source boundary.
+- A cloud-source mirror is not a historical store. The published root must retain
+  every version that Airflow can request.
+- The GCS source adapter does not supply a GCS artifact store. A GCS source uses a
+  filesystem path for `published_root`; the adapter rejects an object-store
+  published root at construction.
 - Clock differences between automatic-publisher hosts can delay publication. A host
   does not publish when the shared candidate timestamp is in its future.
 - Publication to an S3 published root requires conditional writes. Some
@@ -482,14 +544,13 @@ The package is one family: manifest bundles. Each source adapter is one module.
 
 - A new source adapter inherits from `ManifestDagBundleBase`. It prepares one local
   tree and confirms its source observation.
-- A new adapter adds one module (for example, `gcs.py` with
-  `ManifestGCSDagBundle`) and one optional-dependency group in `pyproject.toml`.
+- A new adapter adds one module and one optional-dependency group in `pyproject.toml`.
 - All adapters share `bundle.py` and `manifest.py`. The version calculation and
   artifact lifecycle stay the same for all adapters.
 - The release reference records the artifact backend in its `backend.type` field.
-  Both current source adapters publish local filesystem artifacts. Optional source
-  metadata records the source adapter type, source identity, source observation, and
-  deployment marker observation.
+  All source adapters can publish through the current artifact stores. Optional
+  source metadata records the source adapter type, source identity, source
+  observation, and deployment marker observation.
 
 The artifact store is a second extension point. `store.py` defines the contract.
 The filesystem store and the S3 store implement it. A new artifact store implements

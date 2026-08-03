@@ -41,8 +41,9 @@ jobs:
           uv pip install \
             "apache-airflow==${{ matrix.airflow-version }}" \
             "apache-airflow-providers-amazon==9.10.0" \
+            "apache-airflow-providers-google==18.1.0" \
             pytest \
-            ".[s3]"
+            ".[gcs,s3]"
       # No PYTHONPATH: the tests run against the installed copy of the package.
       - name: Run tests
         run: .venv/bin/python -m pytest -q
