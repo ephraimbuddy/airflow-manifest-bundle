@@ -89,6 +89,7 @@ uv pip install \
 
 "${PUBLISHED_RELEASE_CHECK_DIR}/venv/bin/airflow-manifest-bundle" publish-local --help
 "${PUBLISHED_RELEASE_CHECK_DIR}/venv/bin/airflow-manifest-bundle" publish-s3 --help
+"${PUBLISHED_RELEASE_CHECK_DIR}/venv/bin/airflow-manifest-bundle" publish-gcs --help
 ```
 
 Users can use the same direct-reference form with `pip install`. Installing the wheel

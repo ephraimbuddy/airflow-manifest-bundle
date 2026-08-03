@@ -6,6 +6,7 @@ console script:
 
     airflow-manifest-bundle publish-local <bundle-name> <source-path>
     airflow-manifest-bundle publish-s3 <bundle-name>
+    airflow-manifest-bundle publish-gcs <bundle-name>
 """
 
 from __future__ import annotations
@@ -58,6 +59,25 @@ def _get_manifest_s3_bundle(bundle_name: str, *, action: str):
     return bundle
 
 
+def _get_manifest_gcs_bundle(bundle_name: str, *, action: str):
+    from airflow.dag_processing.bundles.manager import DagBundlesManager
+
+    from airflow_manifest_bundle.gcs import ManifestGCSDagBundle
+
+    bundle = DagBundlesManager().get_bundle(bundle_name)
+    if not isinstance(bundle, ManifestGCSDagBundle):
+        raise SystemExit(
+            f"Bundle {bundle_name!r} is not configured as a ManifestGCSDagBundle. "
+            f"Only manifest-backed GCS bundles can be {action} with this command."
+        )
+    if bundle.auto_publish:
+        raise SystemExit(
+            f"Bundle {bundle_name!r} has auto_publish enabled for automatic publication. "
+            "Set auto_publish=False before using the explicit publisher command."
+        )
+    return bundle
+
+
 def _print_publish_result(result: BundlePublishResult, *, output: str) -> None:
     payload = {
         "bundle_name": result.bundle_name,
@@ -95,6 +115,18 @@ def publish_s3(args: argparse.Namespace) -> None:
 
     bundle = _get_manifest_s3_bundle(args.bundle_name, action="published")
     result = publish_manifest_s3_dag_bundle(
+        bundle=bundle,
+        expected_current_version=args.expected_current_version,
+    )
+    _print_publish_result(result, output=args.output)
+
+
+def publish_gcs(args: argparse.Namespace) -> None:
+    """Publish the configured GCS source for a manifest-backed GCS Dag bundle."""
+    from airflow_manifest_bundle.gcs import publish_manifest_gcs_dag_bundle
+
+    bundle = _get_manifest_gcs_bundle(args.bundle_name, action="published")
+    result = publish_manifest_gcs_dag_bundle(
         bundle=bundle,
         expected_current_version=args.expected_current_version,
     )
@@ -139,6 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_publish_options(publish_s3_parser)
     publish_s3_parser.set_defaults(func=publish_s3)
+
+    publish_gcs_parser = subparsers.add_parser(
+        "publish-gcs",
+        help="Publish the configured GCS source and atomically update the release reference.",
+    )
+    publish_gcs_parser.add_argument(
+        "bundle_name",
+        help="Name of the configured ManifestGCSDagBundle",
+    )
+    _add_common_publish_options(publish_gcs_parser)
+    publish_gcs_parser.set_defaults(func=publish_gcs)
     return parser
 
 

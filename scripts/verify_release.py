@@ -314,6 +314,7 @@ def build_and_validate(
                 "-c",
                 (
                     "from airflow_manifest_bundle import ManifestDagBundleBase; "
+                    "from airflow_manifest_bundle.gcs import ManifestGCSDagBundle; "
                     "from airflow_manifest_bundle.local import ManifestLocalDagBundle; "
                     "from airflow_manifest_bundle.s3 import ManifestS3DagBundle"
                 ),
@@ -321,6 +322,7 @@ def build_and_validate(
         )
         run_command([console_script, "publish-local", "--help"])
         run_command([console_script, "publish-s3", "--help"])
+        run_command([console_script, "publish-gcs", "--help"])
     return artifacts
 
 

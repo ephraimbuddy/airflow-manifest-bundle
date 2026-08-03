@@ -1,18 +1,18 @@
 # airflow-manifest-bundle
 
-Manifest-backed local and S3 Dag bundles for Apache Airflow — install the package,
+Manifest-backed local, S3, and GCS Dag bundles for Apache Airflow — install the package,
 point your bundle config at it, and it works with any standard Airflow 3.0+
 installation.
 
 The Airflow `LocalDagBundle` cannot identify the exact source files a task retry or rerun
 used: files can change after a Dag run is created, so its bundle version resolves nothing.
-`ManifestLocalDagBundle` and `ManifestS3DagBundle` give filesystem and S3 deployments
-reproducible pinned execution without requiring Git. They work like `GitDagBundle`
-does for commits:
+`ManifestLocalDagBundle`, `ManifestS3DagBundle`, and `ManifestGCSDagBundle` give
+filesystem and object-storage deployments reproducible pinned execution without
+requiring Git. They work like `GitDagBundle` does for commits:
 
 - The bundle **publishes** an immutable, content-addressed snapshot automatically
   after the Dag source stays unchanged for a configured interval, or through an
-  explicit local or S3 publisher command.
+  explicit local, S3, or GCS publisher command.
 - The bundle version is a SHA-256 content hash (`sha256-<hex>`), and the release
   reference is updated atomically as the last publication step.
 - Airflow **materializes** snapshots into its normal, disposable bundle cache before
@@ -53,6 +53,20 @@ python -m pip install \
 The base package and the local bundle do not import the Amazon provider. An
 explicit-mode S3 dag processor that only consumes published releases can also use
 the base package; install the S3 extra on the explicit publisher host.
+
+On each host that reads a GCS source, install the optional Google provider dependency:
+
+```bash
+python -m pip install \
+  "apache-airflow==${AIRFLOW_VERSION}" \
+  "airflow-manifest-bundle[gcs] @ ${BUNDLE_WHEEL_URL}"
+```
+
+The base package and explicit-mode GCS dag processors do not need the Google provider
+when they only consume releases from the filesystem `published_root`. Install the
+GCS extra on automatic dag processors and explicit GCS publisher hosts. The GCS
+adapter requires a filesystem `published_root`; it does not support an object-store
+published root yet.
 
 The bundle requires Apache Airflow 3.0 or newer, detected at import time with no
 configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
@@ -106,6 +120,32 @@ disposable local staging, but Airflow never parses or executes that mirror. See 
 [S3 operator guide](docs/s3.md) for the IAM matrix, deployment markers, retention
 lifecycle rules, and Object Lock guidance.
 
+For GCS, use the Google source adapter with a shared filesystem `published_root`:
+
+```ini
+[dag_processor]
+dag_bundle_config_list = [
+    {
+      "name": "my_gcs_dags",
+      "classpath": "airflow_manifest_bundle.gcs.ManifestGCSDagBundle",
+      "kwargs": {
+        "bucket_name": "airflow-dags",
+        "prefix": "dags/",
+        "gcp_conn_id": "google_cloud_default",
+        "published_root": "/shared/dag-releases",
+        "refresh_interval": 30,
+        "deployment_marker_key": ".ready"
+      }
+    }
+  ]
+```
+
+The GCS adapter reads the exact object generations that it observes. It keeps a
+disposable local mirror, computes SHA-256 from the downloaded bytes, and never writes
+to the source bucket. `gcp_conn_id` defaults to `google_cloud_default`, as it does for
+Airflow's stock `GCSDagBundle`. See the [GCS operator guide](docs/gcs.md) for IAM,
+deployment-marker, mirror, and recovery guidance.
+
 With an object-store `published_root`, workers read only the releases prefix, and
 coordination uses conditional writes instead of a lock file — AWS S3 supports them;
 an S3-compatible store without `If-Match` support fails publication with a clear
@@ -156,16 +196,16 @@ override, `AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH`.
 
 Keep these locations separate and non-overlapping:
 
-- **the Dag source** — a mutable local tree or S3 folder, read by the selected publisher
-- **the S3 mirror** — disposable per-host staging used only by the S3 adapter
+- **the Dag source** — a mutable local tree, S3 folder, or GCS folder, read by the publisher
+- **the object-source mirror** — disposable per-host staging used by the S3 or GCS adapter
 - **`published_root`** — the authoritative publication area: a shared filesystem path
   or an `s3://` prefix, writable by publishers and readable by all Airflow components
 - **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
 
 Airflow always parses and executes the immutable snapshot, never the mutable source
-or S3 mirror. `source_path` enables the automatic local publisher. An S3 bundle
-publishes during refresh when `auto_publish` is true. A pinned bundle never
-publishes.
+or object-source mirror. `source_path` enables the automatic local publisher. An S3
+or GCS bundle publishes during refresh when `auto_publish` is true. A pinned bundle
+never publishes.
 
 For explicit local publication, omit `source_path` from the local bundle config. The
 publisher command receives the source path at deployment time:
@@ -291,11 +331,18 @@ Then publish the configured S3 source:
 airflow-manifest-bundle publish-s3 my_dags --output json
 ```
 
+For GCS, set `auto_publish` to false in the same way, then publish the configured
+source:
+
+```bash
+airflow-manifest-bundle publish-gcs my_gcs_dags --output json
+```
+
 Each command reads the named bundle from Airflow configuration, creates or validates
 the content-addressed snapshot, and updates the release reference last. Neither needs
 the Airflow metadata database. The local publishing host needs read access to the
-source and write access to `published_root`. The S3 publishing host needs read-only
-access to the Dag source plus write access to its local mirror and `published_root`
+source and write access to `published_root`. The S3 or GCS publishing host needs
+read-only access to the Dag source plus write access to its local mirror and `published_root`
 — for an object-store root, that means `PutObject` on the releases prefix while the
 source prefix stays read-only.
 
@@ -306,9 +353,10 @@ reference paths, manifest hash, file count, total size, and whether it created t
 snapshot.
 
 The commands reject automatic bundles. Omit `source_path` for an explicit local
-bundle, and set `auto_publish` to false for an explicit S3 bundle. In explicit S3
-mode, dag-processor refreshes do not access S3. Both commands reject an empty source
-by default. Set `allow_empty_source` to true only when an empty release is intended.
+bundle, and set `auto_publish` to false for an explicit S3 or GCS bundle. In explicit
+mode, dag-processor refreshes do not access the source object store. All commands
+reject an empty source by default. Set `allow_empty_source` to true only when an
+empty release is intended.
 
 ## Deployment behavior
 
@@ -388,10 +436,10 @@ what core actually does at runtime:
   newest validated cached version when the just-published release is not materialized
   yet (otherwise the callback would be lost — core deletes callback rows before parsing).
 - **Automatic publication.** `source_path` lets the bundle publish during an unpinned
-  local refresh. The S3 adapter does the same from its isolated mirror. Pinned bundle
-  instances only materialize the requested version.
+  local refresh. The S3 and GCS adapters do the same from isolated mirrors. Pinned
+  bundle instances only materialize the requested version.
 - **Standalone publisher CLI.** External packages cannot add `airflow` subcommands, so
-  explicit local and S3 publication use the `airflow-manifest-bundle` console script.
+  explicit local, S3, and GCS publication use the `airflow-manifest-bundle` console script.
 - **Shared automatic-publisher coordination.** Airflow can run successive refreshes
   in different dag-processor replicas, so the stability candidate lives under
   `published_root`, protected by the publication lock (filesystem roots) or by
@@ -415,13 +463,14 @@ rather than depending on Airflow internals that may change between releases.
 ## Development
 
 ```bash
-pip install -e '.[dev]'
+pip install -e '.[dev,gcs,s3]'
 pytest
 ```
 
-The test suite covers manifest hashing and determinism, local and S3 publication,
-the publisher CLI, S3 mirror safety, validation, and cache materialization and
-self-healing. It runs against an installed Airflow with no database required.
+The test suite covers manifest hashing and determinism, local, S3, and GCS
+publication, the publisher CLI, object-source mirror safety, validation, and cache
+materialization and self-healing. It runs against an installed Airflow with no
+database required.
 
 Maintainers currently publish wheels and source distributions through GitHub Releases.
 See the [release process](docs/releasing.md) for the version, tag, build, publication,

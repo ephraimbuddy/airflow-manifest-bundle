@@ -11,6 +11,7 @@ import pytest
 from _test_utils import conf_vars, published_payload
 
 from airflow_manifest_bundle import ManifestDagBundleBase, cli
+from airflow_manifest_bundle import object_source as object_source_module
 from airflow_manifest_bundle import s3 as s3_module
 from airflow_manifest_bundle.bundle import BundleManifestReferenceChangedError
 from airflow_manifest_bundle.local import (
@@ -23,6 +24,7 @@ from airflow_manifest_bundle.manifest import (
     BundleManifestNotFoundError,
     BundleManifestSourceChangedError,
 )
+from airflow_manifest_bundle.object_source import ObjectStoreSourceDagBundleBase
 from airflow_manifest_bundle.s3 import (
     ManifestS3DagBundle,
     publish_manifest_s3_dag_bundle,
@@ -166,8 +168,10 @@ def _clear_validated_version_paths():
 
 def test_common_base_and_concrete_bundles_are_siblings():
     assert inspect.isabstract(ManifestDagBundleBase)
+    assert inspect.isabstract(ObjectStoreSourceDagBundleBase)
+    assert ObjectStoreSourceDagBundleBase.__bases__ == (ManifestDagBundleBase,)
     assert ManifestLocalDagBundle.__bases__ == (ManifestDagBundleBase,)
-    assert ManifestS3DagBundle.__bases__ == (ManifestDagBundleBase,)
+    assert ManifestS3DagBundle.__bases__ == (ObjectStoreSourceDagBundleBase,)
 
 
 def test_filesystem_published_root_logs_the_fallback_hint(tmp_path, monkeypatch, caplog):
@@ -618,7 +622,7 @@ def test_unchanged_inventory_reuses_mirror_and_release(tmp_path, monkeypatch):
         first_version = _version_string(bundle.get_current_version())
         client.downloads.clear()
         with mock.patch.object(
-            s3_module,
+            object_source_module,
             "compute_file_sha256",
             side_effect=AssertionError("unchanged mirror must not be rehashed"),
         ):

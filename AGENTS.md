@@ -4,9 +4,9 @@ Guidance for AI coding agents (and new contributors) working in this repository.
 
 ## What this is
 
-`airflow-manifest-bundle` is a standalone pip package that provides local and S3
-source adapters for manifest Dag bundles. Both adapters serve immutable,
-content-addressed Dag snapshots from a shared filesystem. The bundle version is the
+`airflow-manifest-bundle` is a standalone pip package that provides local, S3, and
+GCS source adapters for manifest Dag bundles. All adapters serve immutable,
+content-addressed Dag snapshots from a durable published root. The bundle version is the
 SHA-256 content hash of the snapshot's manifest, so snapshots are self-certifying.
 Read `docs/design.md` before changing runtime behavior — it defines the terms and the
 safety argument.
@@ -21,7 +21,13 @@ safety argument.
   snapshot, cache, and validation lifecycle; also home of `FilesystemArtifactStore`,
   which implements the store contract with this file's filesystem helpers.
 - `src/airflow_manifest_bundle/local.py` — local source adapter.
-- `src/airflow_manifest_bundle/s3.py` — read-only S3 source and local mirror adapter.
+- `src/airflow_manifest_bundle/object_source.py` — shared object-store source machinery:
+  observation, mirror synchronization and safety checks, publication confirmation.
+  Every mirror-safety fix belongs here, never in one adapter.
+- `src/airflow_manifest_bundle/s3.py` — read-only S3 source adapter: the S3 client,
+  listing, marker read, and pinned download on top of `object_source.py`.
+- `src/airflow_manifest_bundle/gcs.py` — read-only GCS source adapter: the GCS client,
+  listing, marker read, and generation-pinned download on top of `object_source.py`.
 - `src/airflow_manifest_bundle/s3_store.py` — S3 implementation of the store contract
   for an `s3://` published_root: conditional-write (CAS) documents, manifest-last
   snapshot commits.
