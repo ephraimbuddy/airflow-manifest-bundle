@@ -46,7 +46,7 @@ This document uses each term below with one meaning only.
 | Source observation | The identity of one source state. |
 | Deployment marker | An optional object below a cloud source prefix. A deployment tool writes a new value to it last. |
 | Published root | The location that holds all publications: a shared folder, an S3 location (`s3://bucket/prefix`), or a GCS location (`gs://bucket/prefix`). Its value is the `published_root` option. |
-| Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. |
+| Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. One implementation uses GCS. |
 | Snapshot | One immutable, read-only copy of the source tree in the published root. |
 | Manifest | A JSON file that lists each file of a snapshot with its hash, size, and executable flag. |
 | Release reference | The file `refs/<bundle>/latest.json`. It points to the current snapshot. |

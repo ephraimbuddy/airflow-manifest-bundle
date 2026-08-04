@@ -14,7 +14,7 @@ Use the same explicit Airflow version as the deployment:
 ```bash
 python -m pip install \
   "apache-airflow==3.3.0" \
-  "airflow-manifest-bundle[gcs]==0.4.0"
+  "airflow-manifest-bundle[gcs]==0.3.0"
 ```
 
 The extra installs `apache-airflow-providers-google`. The minimum supported provider
