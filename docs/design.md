@@ -45,8 +45,8 @@ This document uses each term below with one meaning only.
 | GCS mirror | A disposable local copy of the current GCS folder. Airflow does not parse it. |
 | Source observation | The identity of one source state. |
 | Deployment marker | An optional object below a cloud source prefix. A deployment tool writes a new value to it last. |
-| Published root | The location that holds all publications: a shared folder, or an S3 location (`s3://bucket/prefix`). Its value is the `published_root` option. |
-| Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. |
+| Published root | The location that holds all publications: a shared folder, an S3 location (`s3://bucket/prefix`), or a GCS location (`gs://bucket/prefix`). Its value is the `published_root` option. |
+| Artifact store | The code that reads and writes the published root. One implementation uses the filesystem. One implementation uses S3. One implementation uses GCS. |
 | Snapshot | One immutable, read-only copy of the source tree in the published root. |
 | Manifest | A JSON file that lists each file of a snapshot with its hash, size, and executable flag. |
 | Release reference | The file `refs/<bundle>/latest.json`. It points to the current snapshot. |
@@ -59,7 +59,7 @@ This document uses each term below with one meaning only.
 
 ## 5. Parts of the package
 
-The package has ten modules:
+The package has eleven modules:
 
 - `manifest.py` — makes and examines manifests. It computes hashes and versions.
 - `store.py` — defines the artifact-store contract. All access to the published
@@ -73,6 +73,7 @@ The package has ten modules:
 - `s3.py` — contains the S3 source adapter, `ManifestS3DagBundle`.
 - `gcs.py` — contains the GCS source adapter, `ManifestGCSDagBundle`.
 - `s3_store.py` — contains the S3 artifact store for an `s3://` published root.
+- `gcs_store.py` — contains the GCS artifact store for a `gs://` published root.
 - `cli.py` — contains the explicit publisher commands.
 - `_compat.py` — small helpers that keep the package compatible with more than one
   Airflow release.
@@ -86,9 +87,11 @@ adapter. The common classes do not import a cloud provider.
 The source adapter and the artifact store are independent selections. The source
 adapter supplies the Dag files. The artifact store keeps the published artifacts.
 The `published_root` value selects the artifact store. A filesystem path selects the
-filesystem store. An `s3://` URL selects the S3 store. The local and S3 source
-adapters can publish to each artifact store. The GCS source adapter accepts only the
-filesystem store; it rejects an object-store `published_root` at construction.
+filesystem store. An `s3://` URL selects the S3 store. A `gs://` URL selects the GCS
+store. The local source adapter can publish to each artifact store. A cloud source
+adapter accepts the filesystem store and its own cloud's store only: cross-cloud
+pairings (a GCS source with an S3 published root, or the reverse) are rejected at
+construction.
 
 Airflow finds a bundle through its configuration. The classpath is
 `airflow_manifest_bundle.local.ManifestLocalDagBundle`,
@@ -108,10 +111,10 @@ _locks/<bundle>.lock                      the publication lock (filesystem roots
 _state/<bundle>/auto-publish.json         the candidate state for automatic publication
 ```
 
-An S3 published root holds the same structure below its prefix, without `_locks/`.
-Conditional writes protect the release reference and the candidate state there. The
-publisher writes the manifest object last. The manifest object commits the
-snapshot. A version prefix without its manifest object is not a release.
+An S3 or GCS published root holds the same structure below its prefix, without
+`_locks/`. Conditional writes protect the release reference and the candidate state
+there. The publisher writes the manifest object last. The manifest object commits
+the snapshot. A version prefix without its manifest object is not a release.
 
 Airflow writes cache copies to `<dag_bundle_storage_path>/<bundle>/versions/<version>/`.
 The S3 adapter writes its mirror to
@@ -145,8 +148,8 @@ A source adapter returns a prepared source. Automatic publication first complete
 the source stability check. The explicit publisher commands do not do this check.
 The common publisher makes the manifest from the prepared local tree. For a
 filesystem published root, the publisher then gets the publication lock, and other
-publishers wait for it. For an S3 published root, there is no lock; section 8.2
-gives the differences. The publisher reads the release reference again. It then
+publishers wait for it. For an object-store published root, there is no lock;
+section 8.2 gives the differences. The publisher reads the release reference again. It then
 does these steps:
 
 1. If the snapshot for this version exists, it validates the snapshot. If the
@@ -206,17 +209,18 @@ An explicit cloud publisher needs read access to the Dag source. It does not nee
 write access to the Dag source. For an S3 published root, it needs write access to
 the releases prefix. Section 12 gives the permissions.
 
-### 8.2 Publication to an S3 published root
+### 8.2 Publication to an object-store published root
 
-An S3 published root has no lock. The procedure keeps the same steps, with these
-differences:
+An object-store published root has no lock. The procedure keeps the same steps,
+with these differences:
 
 1. The store uploads each file to its final key below the version prefix. It hashes
    each file before the upload and compares the result with the manifest. It writes
    the manifest object last. The manifest object commits the snapshot. When the
-   source and the published root use the same S3 endpoint, the store copies each
-   object on the server side, with a condition on the observed object state. If a
-   copy fails, the store uploads the prepared local file instead.
+   source and the published root use the same endpoint of the same cloud, the store
+   copies each object on the server side, with a condition on the observed object
+   state (the ETag for S3, the generation for GCS). If a copy fails, the store
+   uploads the prepared local file instead.
 2. A write to the release reference or to the candidate state has a condition: the
    document must be unchanged since the last read by this store. When another
    publisher changed the document first, the store reports a conflict. A concurrent
@@ -228,9 +232,11 @@ differences:
    observation.
 
 The same properties hold: idempotent, atomic, and safe with concurrent publishers.
-Publication requires conditional writes (`If-Match` and `If-None-Match`) from the
-object store. AWS S3 supports them. A store without them stops the first
-publication with a clear error. Consumption does not need conditional writes.
+Publication requires conditional writes from the object store. For S3 these are
+`If-Match` and `If-None-Match`; AWS S3 supports them, and an S3-compatible store
+without them stops the first publication with a clear error. For GCS these are
+generation-match preconditions, which every GCS endpoint supports. Consumption does
+not need conditional writes.
 
 ## 9. Automatic publication
 
@@ -479,6 +485,23 @@ For an S3 published root, OS users and file modes do not apply. The permissions 
   artifact store. Workers give the best results with credentials from the default
   AWS chain, because bundle initialization runs before task context.
 
+For a GCS published root, the permissions are:
+
+- A publisher needs `storage.objects.create`, `storage.objects.delete`, and
+  `storage.objects.get` on the releases prefix. GCS treats the replacement of an
+  object as a delete plus a create, and each publication replaces the release
+  reference and the candidate state document; the store never removes published
+  objects. The Dag source prefix stays read-only. Generation-match preconditions
+  need no extra permission.
+- A pinned bundle and a consume-only Dag processor need `storage.objects.get` on
+  the releases prefix, and no other GCS permission.
+- Read access to the source prefix by the store's principal permits server-side
+  rewrites. Without it, the store uploads each file. Both paths give a correct
+  snapshot.
+- The optional `published_root_conn_id` option selects the Google connection of
+  the artifact store. Workers give the best results with Application Default
+  Credentials, because bundle initialization runs before task context.
+
 ## 13. Compatibility
 
 The package operates on Apache Airflow 3.0 and later. The package examines the
@@ -526,17 +549,18 @@ versions. An incompatible change to a file format must use a new schema version.
   stronger cloud-source boundary.
 - A cloud-source mirror is not a historical store. The published root must retain
   every version that Airflow can request.
-- The GCS source adapter does not supply a GCS artifact store. A GCS source uses a
-  filesystem path for `published_root`; the adapter rejects an object-store
-  published root at construction.
+- Cloud source adapters pair only with their own cloud's artifact store or the
+  filesystem store. A GCS source with an S3 published root, or an S3 source with a
+  GCS published root, is rejected at construction.
 - Clock differences between automatic-publisher hosts can delay publication. A host
   does not publish when the shared candidate timestamp is in its future.
-- Publication to an S3 published root requires conditional writes. Some
-  S3-compatible stores do not have them. Consumption operates without them.
-- A publication to an S3 published root can stop before the manifest write. This
-  leaves an uncommitted version prefix. Consumers do not see it. A later
-  publication of the same content completes it. An age-based lifecycle rule can
-  remove abandoned prefixes.
+- Publication to an object-store published root requires conditional writes. Some
+  S3-compatible stores do not have them; every GCS endpoint has them. Consumption
+  operates without them.
+- A publication to an object-store published root can stop before the manifest
+  write. This leaves an uncommitted version prefix. Consumers do not see it. A
+  later publication of the same content completes it. An age-based lifecycle rule
+  can remove abandoned prefixes.
 
 ## 15. Backend extension
 

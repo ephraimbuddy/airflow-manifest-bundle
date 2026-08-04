@@ -315,8 +315,10 @@ def build_and_validate(
                 (
                     "from airflow_manifest_bundle import ManifestDagBundleBase; "
                     "from airflow_manifest_bundle.gcs import ManifestGCSDagBundle; "
+                    "from airflow_manifest_bundle.gcs_store import GCSArtifactStore; "
                     "from airflow_manifest_bundle.local import ManifestLocalDagBundle; "
-                    "from airflow_manifest_bundle.s3 import ManifestS3DagBundle"
+                    "from airflow_manifest_bundle.s3 import ManifestS3DagBundle; "
+                    "from airflow_manifest_bundle.s3_store import S3ArtifactStore"
                 ),
             ]
         )

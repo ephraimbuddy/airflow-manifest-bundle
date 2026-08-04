@@ -16,14 +16,17 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from _gcs_fakes import FakeStoreGCSClient
 from _test_utils import conf_vars
 
 from airflow_manifest_bundle import bundle as bundle_module
+from airflow_manifest_bundle import gcs_store as gcs_store_module
 from airflow_manifest_bundle import s3_store as s3_store_module
 from airflow_manifest_bundle.bundle import (
     BundleManifestReferenceChangedError,
     FilesystemArtifactStore,
 )
+from airflow_manifest_bundle.gcs_store import GCSArtifactStore, parse_gcs_published_root
 from airflow_manifest_bundle.local import (
     ManifestLocalDagBundle,
     publish_manifest_local_dag_bundle,
@@ -43,8 +46,8 @@ BUNDLE_NAME = "contract"
 BUCKET = "dag-bucket"
 
 
-@pytest.fixture(params=["filesystem", "s3"])
-def store(request, tmp_path, fake_s3):
+@pytest.fixture(params=["filesystem", "s3", "gcs"])
+def store(request, tmp_path, fake_s3, fake_gcs):
     if request.param == "filesystem":
         return FilesystemArtifactStore(
             bundle_name=BUNDLE_NAME,
@@ -55,6 +58,10 @@ def store(request, tmp_path, fake_s3):
         return S3ArtifactStore(
             bundle_name=BUNDLE_NAME, published_root=f"s3://{BUCKET}/releases"
         )
+    if request.param == "gcs":
+        return GCSArtifactStore(
+            bundle_name=BUNDLE_NAME, published_root=f"gs://{BUCKET}/releases"
+        )
     raise ValueError(request.param)
 
 
@@ -62,10 +69,12 @@ def _is_filesystem(store) -> bool:
     return isinstance(store, FilesystemArtifactStore)
 
 
-def _corrupt_ref(store, fake_s3) -> None:
+def _corrupt_ref(store, fake_s3, fake_gcs) -> None:
     if _is_filesystem(store):
         store.ref_path.parent.mkdir(parents=True, exist_ok=True)
         store.ref_path.write_text("{not json")
+    elif isinstance(store, GCSArtifactStore):
+        fake_gcs.put(store._ref_key, b"{not json", bucket=BUCKET)
     else:
         fake_s3.put(store._ref_key, b"{not json")
 
@@ -107,9 +116,9 @@ class TestDocuments:
         payload = store.read_ref(missing_message="missing", invalid_message="invalid")
         assert payload == {"schema_version": 1, "bundle_name": BUNDLE_NAME}
 
-    def test_read_ref_invalid_json_raises_with_message(self, store, fake_s3):
+    def test_read_ref_invalid_json_raises_with_message(self, store, fake_s3, fake_gcs):
         store.prepare_publish_areas()
-        _corrupt_ref(store, fake_s3)
+        _corrupt_ref(store, fake_s3, fake_gcs)
         with pytest.raises(BundleManifestError, match="ref is invalid"):
             store.read_ref(missing_message="ref is gone", invalid_message="ref is invalid")
 
@@ -335,6 +344,57 @@ def fake_s3(monkeypatch):
     monkeypatch.setattr(s3_store_module, "S3Hook", FakeHook)
     client.seen_conn_ids = seen_conn_ids
     return client
+
+
+@pytest.fixture
+def fake_gcs(monkeypatch):
+    client = FakeStoreGCSClient()
+    seen_conn_ids: list[str] = []
+
+    class FakeHook:
+        default_conn_name = "google_cloud_default"
+
+        def __init__(self, *, gcp_conn_id: str) -> None:
+            seen_conn_ids.append(gcp_conn_id)
+
+        def get_conn(self):
+            return client
+
+    monkeypatch.setattr(gcs_store_module, "GCSHook", FakeHook)
+    client.seen_conn_ids = seen_conn_ids
+    return client
+
+
+def _publish_to_fake_gcs(
+    client: FakeStoreGCSClient, *, prefix: str, bundle_name: str, source: Path
+):
+    """Populate the fake object store the way an external publisher would: manifest last."""
+    result = build_bundle_version_manifest_result(
+        bundle_name=bundle_name,
+        root=source,
+        backend_type="local",
+    )
+    base = f"{prefix}/versions/{bundle_name}/{result.version}" if prefix else (
+        f"versions/{bundle_name}/{result.version}"
+    )
+    for file_info in result.manifest["files"]:
+        client.put(
+            f"{base}/{file_info['path']}",
+            (source / file_info["path"]).read_bytes(),
+            bucket=BUCKET,
+        )
+    client.put(
+        f"{base}/{MANIFEST_FILE_NAME}",
+        serialize_bundle_version_manifest(result.manifest),
+        bucket=BUCKET,
+    )
+    ref_key = (
+        f"{prefix}/refs/{bundle_name}/latest.json"
+        if prefix
+        else f"refs/{bundle_name}/latest.json"
+    )
+    client.put(ref_key, serialize_bundle_version_manifest(result.ref_payload), bucket=BUCKET)
+    return result
 
 
 def _publish_to_fake_s3(client: FakeStoreS3Client, *, prefix: str, bundle_name: str, source: Path):
@@ -1052,3 +1112,327 @@ class TestBundleWithObjectStoreRoot:
                 published_root=str(tmp_path / "published"),
                 published_root_conn_id="aws_publishing",
             )
+
+
+def _gcs_artifact_store(prefix: str = "releases") -> GCSArtifactStore:
+    root = f"gs://{BUCKET}/{prefix}" if prefix else f"gs://{BUCKET}"
+    return GCSArtifactStore(bundle_name=BUNDLE_NAME, published_root=root)
+
+
+class TestParseGCSPublishedRoot:
+    def test_bucket_and_prefix(self):
+        assert parse_gcs_published_root("gs://bucket/some/prefix/") == ("bucket", "some/prefix")
+
+    def test_bucket_only(self):
+        assert parse_gcs_published_root("gs://bucket") == ("bucket", "")
+
+    @pytest.mark.parametrize(
+        "url",
+        ["http://bucket/prefix", "gs://", "gs:///prefix", "gs://bucket/prefix?versionId=1"],
+    )
+    def test_rejects_invalid_urls(self, url):
+        with pytest.raises(TypeError):
+            parse_gcs_published_root(url)
+
+
+class TestGCSStoreDocumentCAS:
+    def _ref_key(self) -> str:
+        return f"releases/refs/{BUNDLE_NAME}/latest.json"
+
+    def test_requires_google_provider(self, monkeypatch):
+        monkeypatch.setattr(gcs_store_module, "GCSHook", None)
+        with pytest.raises(TypeError, match="requires the Google provider"):
+            _gcs_artifact_store()
+
+    def test_first_write_conditions_on_absence(self, fake_gcs):
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        store.write_ref({"schema_version": 1})
+        assert fake_gcs.put_conditions == [(self._ref_key(), 0)]
+
+    def test_write_without_prior_read_establishes_a_baseline(self, fake_gcs):
+        store = _gcs_artifact_store()
+        store.write_ref({"schema_version": 1})
+        assert fake_gcs.put_conditions == [(self._ref_key(), 0)]
+
+    def test_replacement_conditions_on_the_read_generation(self, fake_gcs):
+        expected_generation = fake_gcs.put(self._ref_key(), b"{}", bucket=BUCKET)
+        store = _gcs_artifact_store()
+        store.read_ref(missing_message="missing", invalid_message="invalid")
+        store.write_ref({"schema_version": 1})
+        assert fake_gcs.put_conditions == [(self._ref_key(), expected_generation)]
+
+    def test_lost_create_race_with_different_content_conflicts(self, fake_gcs):
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        fake_gcs.put(self._ref_key(), b'{"winner":true}', bucket=BUCKET)
+        with pytest.raises(ArtifactStoreConflictError):
+            store.write_ref({"schema_version": 1})
+        # The conflict refreshed the baseline, so a retry replaces the winner cleanly.
+        store.write_ref({"schema_version": 2})
+        assert json.loads(fake_gcs.get(self._ref_key(), bucket=BUCKET)) == {"schema_version": 2}
+
+    def test_lost_race_with_identical_content_is_an_idempotent_win(self, fake_gcs):
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestNotFoundError):
+            store.read_ref(missing_message="missing", invalid_message="invalid")
+        payload = {"schema_version": 1, "bundle_name": BUNDLE_NAME}
+        fake_gcs.put(self._ref_key(), serialize_bundle_version_manifest(payload), bucket=BUCKET)
+        store.write_ref(payload)
+
+    def test_stale_baseline_conflicts_when_another_publisher_won(self, fake_gcs):
+        fake_gcs.put(self._ref_key(), b"{}", bucket=BUCKET)
+        store = _gcs_artifact_store()
+        store.read_ref(missing_message="missing", invalid_message="invalid")
+        fake_gcs.put(self._ref_key(), b'{"winner":true}', bucket=BUCKET)
+        with pytest.raises(ArtifactStoreConflictError):
+            store.write_ref({"schema_version": 1})
+
+    def test_missing_bucket_is_a_configuration_error_not_a_missing_release(self, fake_gcs):
+        fake_gcs.missing_buckets = {BUCKET}
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestError, match="does not exist. Fix the published_root"):
+            store.read_ref(missing_message="ref is gone", invalid_message="invalid")
+
+
+class TestGCSStorePublishSnapshot:
+    def test_manifest_object_is_committed_last(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        store = _gcs_artifact_store()
+        created = store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+        )
+        assert created is True
+        snapshot_puts = [key for key in fake_gcs.put_sequence if f"/{result.version}/" in key]
+        assert snapshot_puts[-1].endswith(f"/{MANIFEST_FILE_NAME}")
+        assert len(snapshot_puts) == len(result.manifest["files"]) + 1
+
+    def test_tampered_committed_manifest_is_refused(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        fake_gcs.put(
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/{MANIFEST_FILE_NAME}",
+            b'{"tampered": true}',
+            bucket=BUCKET,
+        )
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestError, match="refusing to overwrite"):
+            store.publish_snapshot(
+                result.version,
+                manifest=result.manifest,
+                source_root=source,
+                validate_existing=lambda tree: None,
+            )
+
+    def test_source_drift_aborts_before_the_manifest_commits(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _manifest_result(source)
+        (source / "dags" / "example.py").write_text("print('drifted')\n")
+        store = _gcs_artifact_store()
+        with pytest.raises(BundleManifestSourceChangedError):
+            store.publish_snapshot(
+                result.version,
+                manifest=result.manifest,
+                source_root=source,
+                validate_existing=lambda tree: None,
+            )
+        assert store.snapshot_exists(result.version) is False
+
+
+def _gcs_copy_hints_for(fake_gcs, source: Path, result, *, endpoint=None):
+    hints = {}
+    for file_info in result.manifest["files"]:
+        name = f"dags-src/{file_info['path']}"
+        generation = fake_gcs.put(
+            name, (source / file_info["path"]).read_bytes(), bucket="source-bucket"
+        )
+        hints[file_info["path"]] = {
+            "type": "gcs",
+            "endpoint": endpoint,
+            "bucket": "source-bucket",
+            "name": name,
+            "generation": generation,
+        }
+    return hints
+
+
+class TestGCSStoreServerSideRewrite:
+    def _publish_with_hints(self, source, hints):
+        result = _manifest_result(source)
+        store = _gcs_artifact_store()
+        created = store.publish_snapshot(
+            result.version,
+            manifest=result.manifest,
+            source_root=source,
+            validate_existing=lambda tree: None,
+            copy_hints=hints,
+        )
+        return store, result, created
+
+    def test_matching_endpoint_rewrites_instead_of_uploading(self, fake_gcs, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _gcs_copy_hints_for(fake_gcs, source, result)
+
+        store, result, created = self._publish_with_hints(source, hints)
+
+        assert created is True
+        assert len(fake_gcs.rewrites) == len(result.manifest["files"])
+        snapshot_puts = [key for key in fake_gcs.put_sequence if f"/{result.version}/" in key]
+        assert snapshot_puts == [
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/{MANIFEST_FILE_NAME}"
+        ]
+        destination = tmp_path / "dest"
+        destination.mkdir()
+        store.fetch_snapshot(result.version, destination, structural_validator=lambda tree: None)
+        assert (destination / "dags" / "second.py").read_text() == "print('second')\n"
+
+    def test_endpoint_mismatch_uploads_everything(self, fake_gcs, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _gcs_copy_hints_for(
+            fake_gcs, source, result, endpoint="https://elsewhere.example.test"
+        )
+
+        store, result, created = self._publish_with_hints(source, hints)
+
+        assert created is True
+        assert fake_gcs.rewrites == []
+        assert store.snapshot_exists(result.version)
+
+    def test_stale_source_generation_falls_back_for_that_file_only(self, fake_gcs, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _gcs_copy_hints_for(fake_gcs, source, result)
+        stale = hints["dags/example.py"]
+        fake_gcs.put(stale["name"], b"moved on", bucket=stale["bucket"])
+
+        _store, result, created = self._publish_with_hints(source, hints)
+
+        assert created is True
+        assert len(fake_gcs.rewrites) == 1
+        uploaded = [
+            key
+            for key in fake_gcs.put_sequence
+            if f"/{result.version}/" in key and not key.endswith(MANIFEST_FILE_NAME)
+        ]
+        assert uploaded == [
+            f"releases/versions/{BUNDLE_NAME}/{result.version}/dags/example.py"
+        ]
+        # The published object carries the manifest's bytes, not the moved-on source.
+        assert (
+            fake_gcs.get(
+                f"releases/versions/{BUNDLE_NAME}/{result.version}/dags/example.py",
+                bucket=BUCKET,
+            )
+            == b"print('dag')\n"
+        )
+
+    def test_systemic_rewrite_failure_disables_further_attempts(self, fake_gcs, tmp_path):
+        source = _two_file_source(tmp_path / "source")
+        result = _manifest_result(source)
+        hints = _gcs_copy_hints_for(fake_gcs, source, result)
+        fake_gcs.fail_rewrite_with = 403
+
+        store, result, created = self._publish_with_hints(source, hints)
+
+        assert created is True
+        assert fake_gcs.rewrite_attempts == 1
+        assert fake_gcs.rewrites == []
+        assert store.snapshot_exists(result.version)
+
+
+class TestBundleWithGCSStoreRoot:
+    def test_consume_only_refresh_and_parse_path(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _publish_to_fake_gcs(
+            fake_gcs, prefix="releases", bundle_name="my-dags", source=source
+        )
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"gs://{BUCKET}/releases",
+            )
+            bundle.initialize()
+            assert _version_string(bundle.get_current_version()) == result.version
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('dag')\n"
+
+    def test_pinned_initialize_materializes_from_gcs_store(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        result = _publish_to_fake_gcs(
+            fake_gcs, prefix="releases", bundle_name="my-dags", source=source
+        )
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"gs://{BUCKET}/releases",
+                version=result.version,
+            )
+            bundle.initialize()
+            assert (bundle.path / "dags" / "example.py").read_text() == "print('dag')\n"
+
+    def test_auto_publish_local_source_to_gcs_store(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"gs://{BUCKET}/releases",
+                source_path=str(source),
+                source_stability_seconds=0,
+            )
+            bundle.initialize()
+            first_version = _version_string(bundle.get_current_version())
+            ref = json.loads(fake_gcs.get("releases/refs/my-dags/latest.json", bucket=BUCKET))
+            assert ref["version"] == first_version
+
+            (source / "dags" / "example.py").write_text("print('v2')\n")
+            bundle.refresh()
+            second_version = _version_string(bundle.get_current_version())
+            assert second_version != first_version
+            # The first release's objects stay published for pinned work.
+            assert (
+                BUCKET,
+                f"releases/versions/my-dags/{first_version}/{MANIFEST_FILE_NAME}",
+            ) in fake_gcs.records
+
+    def test_explicit_publish_to_gcs_store(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"gs://{BUCKET}/releases",
+            )
+            result = publish_manifest_local_dag_bundle(bundle=bundle, source_path=source)
+            assert result.created_snapshot is True
+            assert str(result.manifest_ref_path) == (
+                f"gs://{BUCKET}/releases/refs/my-dags/latest.json"
+            )
+
+            bundle.refresh()
+            assert _version_string(bundle.get_current_version()) == result.version
+
+    def test_published_root_conn_id_reaches_the_hook(self, fake_gcs, tmp_path):
+        source = _write_source(tmp_path / "source")
+        _publish_to_fake_gcs(fake_gcs, prefix="releases", bundle_name="my-dags", source=source)
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"gs://{BUCKET}/releases",
+                published_root_conn_id="gcp_publishing",
+            )
+            bundle.refresh()
+            assert fake_gcs.seen_conn_ids == ["gcp_publishing"]
+
+    def test_uppercase_scheme_selects_the_gcs_store(self, fake_gcs, tmp_path):
+        with conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}):
+            bundle = ManifestLocalDagBundle(
+                name="my-dags",
+                published_root=f"GS://{BUCKET}/releases",
+            )
+            assert bundle.published_root == f"gs://{BUCKET}/releases"

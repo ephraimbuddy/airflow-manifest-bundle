@@ -146,8 +146,9 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
     ``versions_dir``.
 
     :param published_root: Root containing published snapshots and the current release
-        reference: a shared filesystem path, or an ``s3://bucket/prefix`` URL for an
-        object-store root (publication there requires conditional-write support).
+        reference: a shared filesystem path, or an ``s3://bucket/prefix`` or
+        ``gs://bucket/prefix`` URL for an object-store root (publication there uses
+        conditional writes; S3-compatible stores must support them).
     :param published_root_conn_id: Optional connection for an object-store
         ``published_root``. Invalid for filesystem roots.
     :param source_stability_seconds: How long source metadata must remain unchanged
@@ -189,15 +190,23 @@ class ManifestDagBundleBase(BaseDagBundle, ABC):
                 published_root=published_root_str,
                 aws_conn_id=published_root_conn_id,
             )
+        elif published_root_str.lower().startswith("gs://"):
+            from airflow_manifest_bundle.gcs_store import GCSArtifactStore
+
+            self._store = GCSArtifactStore(
+                bundle_name=self.name,
+                published_root=published_root_str,
+                gcp_conn_id=published_root_conn_id,
+            )
         else:
             # A URL-shaped value that is not a supported scheme must fail loudly instead
             # of becoming a filesystem directory literally named after the URL. This also
-            # catches an s3 URL mangled by pathlib (``Path("s3://b")`` collapses to
-            # ``s3:/b``), which no longer matches the scheme check above.
+            # catches an object-store URL mangled by pathlib (``Path("s3://b")``
+            # collapses to ``s3:/b``), which no longer matches the scheme checks above.
             if ":" in published_root_str.split("/", 1)[0]:
                 raise TypeError(
                     f"Unsupported published_root scheme: {published_root_str!r}. Use a "
-                    "filesystem path or an s3:// URL."
+                    "filesystem path, an s3:// URL, or a gs:// URL."
                 )
             if published_root_conn_id is not None:
                 raise TypeError(
@@ -1429,6 +1438,8 @@ class FilesystemArtifactStore(ArtifactStore):
     (atomic renames, fsyncs, permissions, orphan sweeps) stays in one place. The
     helpers are resolved through module globals at call time.
     """
+
+    store_backend = "filesystem"
 
     def __init__(self, *, bundle_name: str, published_root: Path, cache_root: Path) -> None:
         self.bundle_name = bundle_name

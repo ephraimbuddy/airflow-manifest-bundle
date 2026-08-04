@@ -1,22 +1,23 @@
 """
-S3 artifact store: publish and consume bundle artifacts in an object store.
+GCS artifact store: publish and consume bundle artifacts in Google Cloud Storage.
 
-An S3 ``published_root`` (``s3://bucket/prefix``) holds the same logical layout as a
+A GCS ``published_root`` (``gs://bucket/prefix``) holds the same logical layout as a
 filesystem one — ``versions/<bundle>/<version>/``, ``refs/<bundle>/latest.json``,
-``_state/<bundle>/auto-publish.json`` — with two object-store-specific rules:
+``_state/<bundle>/auto-publish.json`` — with the same two object-store rules the S3
+store established:
 
 - The embedded snapshot manifest object is written **last** during publication, so
   its presence is the commit marker. A version prefix without its manifest is
   invisible, and re-publishing the same content completes it.
 - There is no cross-host lock. The two mutable documents are protected by
-  conditional writes (``If-Match``/``If-None-Match``); a lost race surfaces as
-  ``ArtifactStoreConflictError`` unless the winner wrote identical bytes, which is an
-  idempotent success. Snapshot uploads need no protection: content-addressed keys
-  make concurrent same-content publications write identical objects.
+  generation-match preconditions (``if_generation_match``; ``0`` asserts absence); a
+  lost race surfaces as ``ArtifactStoreConflictError`` unless the winner wrote
+  identical bytes, which is an idempotent success. Snapshot uploads need no
+  protection: content-addressed keys make concurrent same-content publications write
+  identical objects.
 
-Publication therefore requires an object store with conditional-write support (AWS
-S3 has it; some S3-compatible stores do not — those fail with a clear error on the
-first conditional write).
+Unlike S3-compatible stores, every GCS endpoint supports preconditions natively, so
+this store has no "conditional writes unsupported" failure mode.
 """
 
 from __future__ import annotations
@@ -46,50 +47,80 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 try:
-    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    from airflow.providers.google.cloud.hooks.gcs import GCSHook
+    from google.cloud.storage.retry import DEFAULT_RETRY
 except ModuleNotFoundError:
-    S3Hook = None
+    GCSHook = None
+    DEFAULT_RETRY = None
 
 log = logging.getLogger(__name__)
 
-S3_PUBLISHED_ROOT_SCHEME = "s3://"
-
-# HTTP 412 rejects a failed precondition; S3 returns 409 ConditionalRequestConflict
-# when concurrent conditional writes on one key race each other.
-_CONDITIONAL_WRITE_CONFLICT_CODES = frozenset(
-    {"PreconditionFailed", "412", "ConditionalRequestConflict", "409"}
-)
-_CONDITIONAL_WRITE_UNSUPPORTED_CODES = frozenset({"NotImplemented", "501"})
+GCS_PUBLISHED_ROOT_SCHEME = "gs://"
+#: The library-default public endpoint. It is normalized to ``None`` wherever an
+#: endpoint identity is compared, so default deployments never depend on how a
+#: google-cloud-storage release spells its internal endpoint attributes.
+GCS_PUBLIC_API_ENDPOINT = "https://storage.googleapis.com"
 
 #: CAS baseline recording that the document did not exist when last read.
 _MISSING = object()
 
 
-def _s3_error_code(error: Exception) -> str | None:
-    response = getattr(error, "response", None)
-    if not isinstance(response, dict):
+def _gcs_error_code(error: Exception) -> int | None:
+    code = getattr(error, "code", None)
+    if callable(code):
+        code = code()
+    try:
+        return int(code)
+    except (TypeError, ValueError):
         return None
-    error_data = response.get("Error")
-    if not isinstance(error_data, dict):
+
+
+def _is_missing_gcs_error(error: Exception) -> bool:
+    return _gcs_error_code(error) == 404 or type(error).__name__ == "NotFound"
+
+
+def _is_gcs_precondition_error(error: Exception) -> bool:
+    return _gcs_error_code(error) == 412 or type(error).__name__ in {
+        "FailedPrecondition",
+        "PreconditionFailed",
+    }
+
+
+def _is_missing_gcs_bucket_error(error: Exception) -> bool:
+    # GCS reports a missing bucket and a missing object with the same 404; the
+    # message is the only discriminator the API offers, so this is best effort. A
+    # missed match degrades to the generic read/write error, never to a false
+    # "artifact is not published".
+    return _is_missing_gcs_error(error) and "bucket does not exist" in str(error).lower()
+
+
+def normalized_gcs_api_endpoint(client: Any) -> str | None:
+    """
+    Best-effort endpoint identity of a google-cloud-storage client.
+
+    The attributes are library internals, so the default endpoint must map to a
+    stable value: a missing attribute and the public endpoint both become ``None``;
+    only a configured custom endpoint stays visible. Trailing slashes are stripped
+    so a library spelling change cannot alter the identity of a custom endpoint.
+    """
+    connection = getattr(client, "_connection", None)
+    endpoint = getattr(connection, "API_BASE_URL", None)
+    if not isinstance(endpoint, str):
+        client_options = getattr(client, "_client_options", None)
+        endpoint = getattr(client_options, "api_endpoint", None)
+    if not isinstance(endpoint, str) or not endpoint:
         return None
-    return str(error_data.get("Code"))
+    endpoint = endpoint.rstrip("/")
+    if endpoint == GCS_PUBLIC_API_ENDPOINT:
+        return None
+    return endpoint
 
 
-def _is_missing_s3_object_error(error: Exception) -> bool:
-    # NoSuchBucket is deliberately not in this set: a missing bucket is a
-    # configuration problem and must not read as "the artifact is not published".
-    return _s3_error_code(error) in {"404", "NoSuchKey", "NotFound"}
-
-
-def _is_missing_s3_bucket_error(error: Exception) -> bool:
-    return _s3_error_code(error) == "NoSuchBucket"
-
-
-def parse_s3_published_root(published_root: str) -> tuple[str, str]:
-    """Split ``s3://bucket[/prefix]`` into (bucket, normalized prefix without slashes)."""
-    if not published_root[: len(S3_PUBLISHED_ROOT_SCHEME)].lower() == S3_PUBLISHED_ROOT_SCHEME:
-        raise TypeError(f"published_root {published_root!r} is not an s3:// URL")
-    remainder = published_root[len(S3_PUBLISHED_ROOT_SCHEME) :]
+def parse_gcs_published_root(published_root: str) -> tuple[str, str]:
+    """Split ``gs://bucket[/prefix]`` into (bucket, normalized prefix without slashes)."""
+    if not published_root[: len(GCS_PUBLISHED_ROOT_SCHEME)].lower() == GCS_PUBLISHED_ROOT_SCHEME:
+        raise TypeError(f"published_root {published_root!r} is not a gs:// URL")
+    remainder = published_root[len(GCS_PUBLISHED_ROOT_SCHEME) :]
     bucket, _, prefix = remainder.partition("/")
     if not bucket:
         raise TypeError(f"published_root {published_root!r} does not contain a bucket name")
@@ -98,10 +129,10 @@ def parse_s3_published_root(published_root: str) -> tuple[str, str]:
     return bucket, prefix.strip("/")
 
 
-class S3ArtifactStore(ArtifactStore):
+class GCSArtifactStore(ArtifactStore):
     """Object-store artifact backend: CAS-coordinated publication, manifest-last commits."""
 
-    store_backend = "s3"
+    store_backend = "gcs"
     supports_publication = True
 
     def __init__(
@@ -109,25 +140,25 @@ class S3ArtifactStore(ArtifactStore):
         *,
         bundle_name: str,
         published_root: str,
-        aws_conn_id: str | None = None,
+        gcp_conn_id: str | None = None,
     ) -> None:
-        if S3Hook is None:
+        if GCSHook is None:
             # TypeError for the same reason bundle constructors use it: stock callback
             # preparation swallows ValueError from bundle construction as "bundle no
             # longer configured".
             raise TypeError(
-                "An s3:// published_root requires the Amazon provider. Install "
-                "'airflow-manifest-bundle[s3]' on every host that reads it."
+                "A gs:// published_root requires the Google provider. Install "
+                "'airflow-manifest-bundle[gcs]' on every host that reads it."
             )
-        if aws_conn_id is not None and (not isinstance(aws_conn_id, str) or not aws_conn_id):
+        if gcp_conn_id is not None and (not isinstance(gcp_conn_id, str) or not gcp_conn_id):
             raise TypeError("published_root_conn_id must be a non-empty string")
         self.bundle_name = bundle_name
-        self.bucket_name, self._prefix = parse_s3_published_root(published_root)
-        self.aws_conn_id = aws_conn_id if aws_conn_id is not None else S3Hook.default_conn_name
-        self._s3_hook: Any | None = None
-        # CAS baselines for the mutable documents: key -> ETag from the last read or
-        # write, or _MISSING when the last read found no document. Absent means no
-        # baseline; the next write re-reads to establish one.
+        self.bucket_name, self._prefix = parse_gcs_published_root(published_root)
+        self.gcp_conn_id = gcp_conn_id if gcp_conn_id is not None else GCSHook.default_conn_name
+        self._gcs_hook: Any | None = None
+        # CAS baselines for the mutable documents: key -> generation from the last
+        # read or write, or _MISSING when the last read found no document. Absent
+        # means no baseline; the next write re-reads to establish one.
         self._document_tokens: dict[str, Any] = {}
 
     # --- locators -------------------------------------------------------------
@@ -137,12 +168,12 @@ class S3ArtifactStore(ArtifactStore):
         return "/".join(segments)
 
     def _url(self, key: str) -> str:
-        return f"{S3_PUBLISHED_ROOT_SCHEME}{self.bucket_name}/{key}" if key else self.root
+        return f"{GCS_PUBLISHED_ROOT_SCHEME}{self.bucket_name}/{key}" if key else self.root
 
     @property
     def root(self) -> str:
         suffix = f"/{self._prefix}" if self._prefix else ""
-        return f"{S3_PUBLISHED_ROOT_SCHEME}{self.bucket_name}{suffix}"
+        return f"{GCS_PUBLISHED_ROOT_SCHEME}{self.bucket_name}{suffix}"
 
     @property
     def ref_path(self) -> str:
@@ -173,59 +204,64 @@ class S3ArtifactStore(ArtifactStore):
     # --- client ---------------------------------------------------------------
 
     @property
-    def s3_hook(self) -> Any:
-        if self._s3_hook is None:
+    def gcs_hook(self) -> Any:
+        if self._gcs_hook is None:
             try:
-                self._s3_hook = S3Hook(aws_conn_id=self.aws_conn_id)
+                self._gcs_hook = GCSHook(gcp_conn_id=self.gcp_conn_id)
             except Exception as e:
                 raise BundleManifestError(
-                    f"Could not create an S3 client for published_root {self.root}"
+                    f"Could not create a GCS client for published_root {self.root}"
                 ) from e
-        return self._s3_hook
+        return self._gcs_hook
 
     def _get_client(self) -> Any:
         try:
-            return self.s3_hook.get_conn()
+            return self.gcs_hook.get_conn()
         except BundleManifestError:
             raise
         except Exception as e:
             raise BundleManifestError(
-                f"Could not create an S3 client for published_root {self.root}"
+                f"Could not create a GCS client for published_root {self.root}"
             ) from e
 
-    def _get_object(self, key: str) -> tuple[bytes, str | None] | None:
-        """Return (body, ETag) for the object, or None when it does not exist."""
-        client = self._get_client()
+    def _blob(self, key: str, *, generation: int | None = None) -> Any:
+        return self._get_client().bucket(self.bucket_name).blob(key, generation=generation)
+
+    def _get_object(self, key: str) -> tuple[bytes, int | None] | None:
+        """Return (body, generation) for the object, or None when it does not exist."""
+        blob = self._blob(key)
         try:
-            response = client.get_object(Bucket=self.bucket_name, Key=key)
-            body = response["Body"]
-            data = b"".join(iter(lambda: body.read(1024 * 1024), b""))
+            data = blob.download_as_bytes()
         except Exception as e:
-            if _is_missing_s3_object_error(e):
+            if _is_missing_gcs_error(e) and not _is_missing_gcs_bucket_error(e):
                 return None
             raise self._read_error(key, e) from e
-        etag = response.get("ETag")
-        return data, (str(etag) if etag else None)
+        # The download response carries the served object's generation; the pair is
+        # therefore consistent even under concurrent replacement.
+        generation = getattr(blob, "generation", None)
+        return data, (generation if isinstance(generation, int) else None)
 
     def _get_object_bytes(self, key: str) -> bytes | None:
-        """Return the object body, or None when the object does not exist."""
         result = self._get_object(key)
         return None if result is None else result[0]
 
     def _object_exists(self, key: str) -> bool:
-        client = self._get_client()
+        # reload(), not exists(): the library's exists() also reports a missing
+        # bucket as False, which would read as "not published" instead of the
+        # configuration error below.
+        blob = self._blob(key)
         try:
-            client.head_object(Bucket=self.bucket_name, Key=key)
+            blob.reload()
         except Exception as e:
-            if _is_missing_s3_object_error(e):
+            if _is_missing_gcs_error(e) and not _is_missing_gcs_bucket_error(e):
                 return False
             raise self._read_error(key, e) from e
         return True
 
     def _read_error(self, key: str, error: Exception) -> BundleManifestError:
-        if _is_missing_s3_bucket_error(error):
+        if _is_missing_gcs_bucket_error(error):
             return BundleManifestError(
-                f"S3 bucket {self.bucket_name!r} for published_root {self.root} does not "
+                f"GCS bucket {self.bucket_name!r} for published_root {self.root} does not "
                 "exist. Fix the published_root configuration before refreshing this bundle."
             )
         return BundleManifestError(
@@ -234,15 +270,17 @@ class S3ArtifactStore(ArtifactStore):
 
     # --- mutable documents ----------------------------------------------------
 
-    def _read_json_object(self, key: str, *, missing_message: str, invalid_message: str) -> dict[str, Any]:
+    def _read_json_object(
+        self, key: str, *, missing_message: str, invalid_message: str
+    ) -> dict[str, Any]:
         result = self._get_object(key)
         if result is None:
             self._document_tokens[key] = _MISSING
             raise BundleManifestNotFoundError(missing_message)
-        data, etag = result
+        data, generation = result
         # Record the CAS baseline before parsing: a later write may deliberately
         # replace a corrupt document.
-        self._record_document_token(key, etag)
+        self._record_document_token(key, generation)
         try:
             payload = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -251,9 +289,9 @@ class S3ArtifactStore(ArtifactStore):
             raise BundleManifestError(invalid_message)
         return payload
 
-    def _record_document_token(self, key: str, etag: str | None) -> None:
-        if etag:
-            self._document_tokens[key] = etag
+    def _record_document_token(self, key: str, generation: int | None) -> None:
+        if generation:
+            self._document_tokens[key] = generation
         else:
             self._document_tokens.pop(key, None)
 
@@ -281,15 +319,16 @@ class S3ArtifactStore(ArtifactStore):
             token = result[1] if result is not None and result[1] else _MISSING
             self._document_tokens[key] = token
         body = serialize_bundle_version_manifest(payload)
-        conditional = {"IfNoneMatch": "*"} if token is _MISSING else {"IfMatch": token}
-        client = self._get_client()
+        expected_generation = 0 if token is _MISSING else token
+        blob = self._blob(key)
         try:
-            response = client.put_object(
-                Bucket=self.bucket_name, Key=key, Body=body, **conditional
+            blob.upload_from_string(
+                body,
+                content_type="application/json",
+                if_generation_match=expected_generation,
             )
         except Exception as e:
-            code = _s3_error_code(e)
-            if code in _CONDITIONAL_WRITE_CONFLICT_CODES:
+            if _is_gcs_precondition_error(e):
                 current = self._get_object(key)
                 if current is None:
                     self._document_tokens[key] = _MISSING
@@ -301,14 +340,9 @@ class S3ArtifactStore(ArtifactStore):
                 raise ArtifactStoreConflictError(
                     f"Another publisher updated {self._url(key)} concurrently"
                 ) from e
-            if code in _CONDITIONAL_WRITE_UNSUPPORTED_CODES:
-                raise BundleManifestError(
-                    f"The object store for published_root {self.root} does not support "
-                    "conditional writes, which publication requires. Use a store with "
-                    "If-Match support or publish through a filesystem published_root."
-                ) from e
             raise self._write_error(key, e) from e
-        self._record_document_token(key, response.get("ETag"))
+        generation = getattr(blob, "generation", None)
+        self._record_document_token(key, generation if isinstance(generation, int) else None)
 
     # --- coordination ---------------------------------------------------------
 
@@ -383,20 +417,20 @@ class S3ArtifactStore(ArtifactStore):
                 file_info=file_info,
             )
 
-    def _download_snapshot_file(self, *, key: str, destination: Path, file_info: dict[str, Any]) -> None:
-        client = self._get_client()
+    def _download_snapshot_file(
+        self, *, key: str, destination: Path, file_info: dict[str, Any]
+    ) -> None:
+        blob = self._blob(key)
         digest = hashlib.sha256()
         size = 0
         try:
-            response = client.get_object(Bucket=self.bucket_name, Key=key)
-            body = response["Body"]
-            with destination.open("wb") as file:
-                for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            with destination.open("wb") as file, blob.open("rb") as reader:
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
                     file.write(chunk)
                     digest.update(chunk)
                     size += len(chunk)
         except Exception as e:
-            if _is_missing_s3_object_error(e):
+            if _is_missing_gcs_error(e) and not _is_missing_gcs_bucket_error(e):
                 raise BundleManifestError(
                     f"Bundle snapshot at {self._url(key)} is missing manifest entry "
                     f"{file_info['path']!r}"
@@ -431,15 +465,15 @@ class S3ArtifactStore(ArtifactStore):
                 )
             return False
 
-        # One failed copy that is not a per-object precondition miss disables further
-        # attempts for this publication: a systemic cause (permissions, cross-account,
-        # unsupported operation) would otherwise fail once per file.
+        # One failed rewrite that is not a per-object precondition miss disables
+        # further attempts for this publication: a systemic cause (permissions,
+        # cross-project restrictions) would otherwise fail once per file.
         copy_disabled = not copy_hints
         for file_info in manifest["files"]:
             relative_path = ManifestDagBundleBase._validate_manifest_file_info(file_info)
             destination_key = self._snapshot_key(version, *relative_path.split("/"))
             if not copy_disabled:
-                copied, copy_disabled = self._try_server_side_copy(
+                copied, copy_disabled = self._try_server_side_rewrite(
                     hint=copy_hints.get(relative_path),
                     destination_key=destination_key,
                 )
@@ -471,54 +505,64 @@ class S3ArtifactStore(ArtifactStore):
         self._put_object(manifest_key, manifest_bytes)
         return True
 
-    def _try_server_side_copy(
+    def _try_server_side_rewrite(
         self,
         *,
         hint: dict[str, Any] | None,
         destination_key: str,
     ) -> tuple[bool, bool]:
         """
-        Attempt one server-side copy. Returns (copied, disable_further_attempts).
+        Attempt one server-side rewrite. Returns (copied, disable_further_attempts).
 
-        ``CopySourceIfMatch`` pins the copy to the exact object the manifest hashes
-        were computed from: if the source moved on, the store refuses the copy and the
+        The rewrite is pinned to the exact generation the manifest hashes were
+        computed from: if the source moved on, the store refuses the rewrite and the
         caller uploads the prepared local bytes instead — which still match the
         manifest. A lying object store is caught at fetch time, where every file is
         hash-verified against the manifest before use.
         """
-        if not isinstance(hint, dict) or hint.get("type") != "s3":
+        if not isinstance(hint, dict) or hint.get("type") != "gcs":
             return False, False
         bucket = hint.get("bucket")
-        key = hint.get("key")
-        etag = hint.get("etag")
-        if not all(isinstance(value, str) and value for value in (bucket, key, etag)):
+        name = hint.get("name")
+        generation = hint.get("generation")
+        if (
+            not all(isinstance(value, str) and value for value in (bucket, name))
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+        ):
             return False, False
         client = self._get_client()
-        endpoint = getattr(getattr(client, "meta", None), "endpoint_url", None)
-        if hint.get("endpoint") != endpoint:
-            # Different endpoints cannot copy server-side; no point retrying per file.
+        if hint.get("endpoint") != normalized_gcs_api_endpoint(client):
+            # Different endpoints cannot rewrite server-side; no point retrying per file.
             return False, True
         try:
-            client.copy_object(
-                Bucket=self.bucket_name,
-                Key=destination_key,
-                CopySource={"Bucket": bucket, "Key": key},
-                CopySourceIfMatch=etag,
+            source_blob = client.bucket(bucket).blob(name, generation=generation)
+            destination_blob = client.bucket(self.bucket_name).blob(destination_key)
+            token, _, _ = destination_blob.rewrite(
+                source_blob, if_source_generation_match=generation
             )
+            while token is not None:
+                token, _, _ = destination_blob.rewrite(
+                    source_blob,
+                    token=token,
+                    if_source_generation_match=generation,
+                )
         except Exception as e:
-            code = _s3_error_code(e)
-            if code in _CONDITIONAL_WRITE_CONFLICT_CODES or _is_missing_s3_object_error(e):
+            if _is_gcs_precondition_error(e) or (
+                _is_missing_gcs_error(e) and not _is_missing_gcs_bucket_error(e)
+            ):
                 # This one object changed or vanished since it was observed; the
                 # prepared local copy still matches the manifest, so upload it and
-                # keep trying copies for the remaining files.
+                # keep trying rewrites for the remaining files.
                 log.debug(
-                    "Server-side copy precondition failed; uploading the prepared copy. "
-                    "destination=%s",
+                    "Server-side rewrite precondition failed; uploading the prepared "
+                    "copy. destination=%s",
                     self._url(destination_key),
                 )
                 return False, False
             log.info(
-                "Server-side copy failed; publishing by upload instead. destination=%s",
+                "Server-side rewrite failed; publishing by upload instead. destination=%s",
                 self._url(destination_key),
                 exc_info=True,
             )
@@ -526,16 +570,19 @@ class S3ArtifactStore(ArtifactStore):
         return True, False
 
     def _put_object(self, key: str, body: bytes) -> None:
-        client = self._get_client()
+        # The library does not retry unconditioned uploads by default. These
+        # writes are retry-safe by construction: snapshot objects live at
+        # content-addressed keys, and the manifest overwrite is self-healing.
+        blob = self._blob(key)
         try:
-            client.put_object(Bucket=self.bucket_name, Key=key, Body=body)
+            blob.upload_from_string(body, retry=DEFAULT_RETRY)
         except Exception as e:
             raise self._write_error(key, e) from e
 
     def _write_error(self, key: str, error: Exception) -> BundleManifestError:
-        if _is_missing_s3_bucket_error(error):
+        if _is_missing_gcs_bucket_error(error):
             return BundleManifestError(
-                f"S3 bucket {self.bucket_name!r} for published_root {self.root} does not "
+                f"GCS bucket {self.bucket_name!r} for published_root {self.root} does not "
                 "exist. Fix the published_root configuration before publishing."
             )
         return BundleManifestError(
@@ -547,14 +594,16 @@ class S3ArtifactStore(ArtifactStore):
         Nothing to sweep: object-store publication writes no temporary artifacts.
 
         Uploads land at their final content-addressed keys and the manifest object
-        commits the snapshot. A crash before the manifest PUT leaves an uncommitted
+        commits the snapshot. A crash before the manifest upload leaves an uncommitted
         prefix that a later publication of the same content completes; reclaiming
         abandoned prefixes is a deployment-side lifecycle concern.
         """
 
 
 __all__ = [
-    "S3_PUBLISHED_ROOT_SCHEME",
-    "S3ArtifactStore",
-    "parse_s3_published_root",
+    "GCS_PUBLIC_API_ENDPOINT",
+    "GCS_PUBLISHED_ROOT_SCHEME",
+    "GCSArtifactStore",
+    "normalized_gcs_api_endpoint",
+    "parse_gcs_published_root",
 ]

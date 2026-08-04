@@ -177,11 +177,12 @@ def _install_fake_hook(monkeypatch, client: FakeGCSClient):
 
 def _bundle(tmp_path: Path, **kwargs) -> ManifestGCSDagBundle:
     prefix = kwargs.pop("prefix", "dags/")
+    published_root = kwargs.pop("published_root", str(tmp_path / "published"))
     return ManifestGCSDagBundle(
         name="manifest-gcs",
         bucket_name="dag-bucket",
         prefix=prefix,
-        published_root=str(tmp_path / "published"),
+        published_root=published_root,
         source_stability_seconds=0,
         **kwargs,
     )
@@ -256,11 +257,11 @@ def test_constructor_rejects_invalid_options(tmp_path, option, value):
         _bundle(tmp_path, **{option: value})
 
 
-def test_constructor_rejects_object_store_published_root(tmp_path, monkeypatch):
+def test_constructor_rejects_cross_cloud_published_root(tmp_path, monkeypatch):
     from airflow_manifest_bundle import s3_store
 
     # The store itself must construct so the test exercises the GCS adapter's
-    # restriction, not a missing Amazon provider.
+    # policy, not a missing Amazon provider.
     monkeypatch.setattr(
         s3_store, "S3Hook", SimpleNamespace(default_conn_name="aws_default")
     )
@@ -268,7 +269,7 @@ def test_constructor_rejects_object_store_published_root(tmp_path, monkeypatch):
         conf_vars(
             {("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}
         ),
-        pytest.raises(TypeError, match="filesystem published_root"),
+        pytest.raises(TypeError, match="Cross-cloud publication is not supported"),
     ):
         ManifestGCSDagBundle(
             name="manifest-gcs",
@@ -863,3 +864,109 @@ def test_source_identity_normalizes_the_default_public_endpoint(tmp_path, monkey
         _install_fake_hook(monkeypatch, custom_client)
         custom = _bundle(tmp_path)
         assert custom._source_identity(custom._get_gcs_client()) != default_identity
+
+
+def test_prepare_publish_source_populates_copy_hints(tmp_path, monkeypatch):
+    client = FakeGCSClient()
+    client.put("dags/example.py", b"print('dag')")
+    generation = client.objects["dags/example.py"]["generation"]
+    _install_fake_hook(monkeypatch, client)
+
+    with conf_vars(
+        {("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}
+    ):
+        bundle = _bundle(tmp_path)
+        prepared = bundle._prepare_publish_source()
+
+    assert prepared.copy_hints == {
+        "example.py": {
+            "type": "gcs",
+            "endpoint": "https://storage.example.test",
+            "bucket": "dag-bucket",
+            "name": "dags/example.py",
+            "generation": generation,
+        }
+    }
+
+
+def test_filesystem_published_root_logs_the_fallback_hint(tmp_path, monkeypatch, caplog):
+    client = FakeGCSClient()
+    _install_fake_hook(monkeypatch, client)
+
+    with (
+        conf_vars(
+            {("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}
+        ),
+        caplog.at_level("INFO", logger="airflow_manifest_bundle.gcs"),
+    ):
+        _bundle(tmp_path)
+
+    assert "gs:// published_root removes the shared filesystem" in caplog.text
+
+    # Pinned bundles are constructed for every task; workers must not see the hint.
+    caplog.clear()
+    with (
+        conf_vars(
+            {("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}
+        ),
+        caplog.at_level("INFO", logger="airflow_manifest_bundle.gcs"),
+    ):
+        _bundle(tmp_path, version="sha256-" + "0" * 64)
+
+    assert "gs:// published_root removes the shared filesystem" not in caplog.text
+
+
+def _install_fake_store_hook(monkeypatch, client):
+    from airflow_manifest_bundle import gcs_store as gcs_store_module
+
+    class FakeStoreHook:
+        default_conn_name = "google_cloud_default"
+
+        def __init__(self, *, gcp_conn_id: str) -> None:
+            self.gcp_conn_id = gcp_conn_id
+
+        def get_conn(self):
+            return client
+
+    monkeypatch.setattr(gcs_store_module, "GCSHook", FakeStoreHook)
+
+
+def test_gcs_source_with_gcs_published_root_publishes_and_pins(tmp_path, monkeypatch, caplog):
+    from _gcs_fakes import FakeStoreGCSClient
+
+    source_client = FakeGCSClient()
+    source_client.put("dags/example.py", b"print('dag')")
+    _install_fake_hook(monkeypatch, source_client)
+    store_client = FakeStoreGCSClient()
+    _install_fake_store_hook(monkeypatch, store_client)
+
+    with (
+        conf_vars(
+            {("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}
+        ),
+        caplog.at_level("INFO", logger="airflow_manifest_bundle.gcs"),
+    ):
+        bundle = _bundle(tmp_path, published_root="gs://release-bucket/releases")
+        bundle.refresh()
+        version = _version_string(bundle.get_current_version())
+
+        assert (bundle.path / "example.py").read_bytes() == b"print('dag')"
+        ref = json.loads(
+            store_client.get("releases/refs/manifest-gcs/latest.json", bucket="release-bucket")
+        )
+        assert ref["version"] == version
+        assert ref["source"]["type"] == "gcs"
+        # The gs:// root removes the shared filesystem, so no fallback hint is logged.
+        assert "removes the shared filesystem" not in caplog.text
+
+        # Pinned execution reads only the published root, never the source.
+        class ForbiddenHook:
+            def __init__(self, **kwargs):
+                raise AssertionError(f"GCS source hook must not be constructed: {kwargs}")
+
+        monkeypatch.setattr(gcs_module, "GCSHook", ForbiddenHook)
+        pinned = _bundle(
+            tmp_path, published_root="gs://release-bucket/releases", version=version
+        )
+        pinned.initialize()
+        assert (pinned.path / "example.py").read_bytes() == b"print('dag')"

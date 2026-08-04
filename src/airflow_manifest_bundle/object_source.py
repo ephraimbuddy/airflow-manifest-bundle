@@ -53,6 +53,12 @@ DEFAULT_MAX_TOTAL_SIZE_BYTES = 1024 * 1024 * 1024
 
 log = logging.getLogger(__name__)
 
+_STORE_BACKEND_DESCRIPTIONS = {
+    "filesystem": "a filesystem path",
+    "s3": "an s3:// URL",
+    "gcs": "a gs:// URL",
+}
+
 
 @dataclass(frozen=True)
 class ObjectSourceObservation:
@@ -97,6 +103,10 @@ class ObjectStoreSourceDagBundleBase(ManifestDagBundleBase):
     _marker_key_requirement: str
     #: Requirement wording for an unsafe marker key.
     _marker_key_safe_requirement: str
+    #: ``store_backend`` values this adapter may publish to and consume from.
+    #: Cross-cloud pairings (a GCS source with an S3 published_root, or the
+    #: reverse) are rejected at construction.
+    _compatible_store_backends: tuple[str, ...]
 
     def __init__(
         self,
@@ -142,6 +152,17 @@ class ObjectStoreSourceDagBundleBase(ManifestDagBundleBase):
                 "auto_publish requires a published_root that supports publication; the "
                 "configured published_root is consume-only. Set auto_publish=False or use "
                 "a published_root that publishers can write."
+            )
+        store_backend = self._store.store_backend
+        if store_backend not in self._compatible_store_backends:
+            supported = " or ".join(
+                _STORE_BACKEND_DESCRIPTIONS.get(backend, backend)
+                for backend in self._compatible_store_backends
+            )
+            raise TypeError(
+                f"{type(self).__name__} does not support the configured published_root "
+                f"{self.published_root!r} ({store_backend} store backend). Cross-cloud "
+                f"publication is not supported; use {supported}."
             )
         self._normalized_prefix = prefix.rstrip("/")
         self._marker_remote_name = (

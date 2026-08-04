@@ -244,6 +244,26 @@ def test_constructor_matches_oss_defaults_and_constructs_hook_lazily(tmp_path, m
         assert custom.view_url_template() == "https://dag-bucket.s3.us-east-2.amazonaws.com/dags/"
 
 
+def test_constructor_rejects_cross_cloud_published_root(tmp_path, monkeypatch):
+    from airflow_manifest_bundle import gcs_store
+
+    # The store itself must construct so the test exercises the S3 adapter's
+    # policy, not a missing Google provider.
+    monkeypatch.setattr(
+        gcs_store, "GCSHook", SimpleNamespace(default_conn_name="google_cloud_default")
+    )
+    with (
+        conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),
+        pytest.raises(TypeError, match="Cross-cloud publication is not supported"),
+    ):
+        ManifestS3DagBundle(
+            name="manifest-s3",
+            bucket_name="dag-bucket",
+            prefix="dags/",
+            published_root="gs://dag-releases/team",
+        )
+
+
 def test_constructor_rejects_non_boolean_auto_publish(tmp_path):
     with (
         conf_vars({("dag_processor", "dag_bundle_storage_path"): str(tmp_path / "bundles")}),

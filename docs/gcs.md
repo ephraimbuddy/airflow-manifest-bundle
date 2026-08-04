@@ -21,8 +21,9 @@ The extra installs `apache-airflow-providers-google`. The minimum supported prov
 version is 18.1.0, which introduced Airflow's stock `GCSDagBundle` used as the
 configuration compatibility reference.
 
-An explicit-mode dag processor only consumes releases from `published_root`, so it
-can use the base package without the GCS extra.
+An explicit-mode dag processor only consumes releases from `published_root`. With a
+filesystem published root it can use the base package without the GCS extra; a
+`gs://` published root needs the GCS extra on every host that reads it.
 
 ## Configuration
 
@@ -36,7 +37,7 @@ dag_bundle_config_list = [
         "bucket_name": "airflow-dags",
         "prefix": "production/",
         "gcp_conn_id": "google_cloud_default",
-        "published_root": "/mnt/shared/airflow-bundles",
+        "published_root": "gs://airflow-dag-releases/releases",
         "refresh_interval": 30,
         "source_stability_seconds": 30,
         "deployment_marker_key": ".ready"
@@ -65,10 +66,13 @@ The manifest extensions are:
 - `max_total_size_bytes`: maximum bytes in all included objects. The default is
   1,073,741,824 (1 GiB).
 
-`published_root` must be a durable shared filesystem path. Object-store published
-roots (`s3://`, `gs://`) are not supported for this adapter yet, and the constructor
-rejects them. GCS is the mutable source in this adapter; the published root is the
-historical store that must retain every version Airflow can request.
+`published_root` can be a durable shared filesystem path or a `gs://` URL. A
+`gs://` published root is recommended — pinned execution then reads the releases
+prefix directly and no shared filesystem is needed. An `s3://` published root is
+rejected at construction: cross-cloud publication is not supported. GCS is the
+mutable source in this adapter; the published root is the historical store that
+must retain every version Airflow can request. Keep the published root outside the
+source prefix — a separate bucket, or a disjoint prefix in the same bucket.
 
 A configured `prefix` with no objects raises a recoverable not-found error instead
 of publishing, so a mistyped prefix cannot look like an emptied Dag source. Set
@@ -89,9 +93,14 @@ The published root is authoritative:
 ```text
 versions/<bundle>/sha256-<hex>/           immutable snapshots
 refs/<bundle>/latest.json                 current release reference
-_locks/<bundle>.lock                      publication lock
+_locks/<bundle>.lock                      publication lock (filesystem roots only)
 _state/<bundle>/auto-publish.json         shared stability candidate
 ```
+
+A `gs://` published root holds the same structure below its prefix, without
+`_locks/`: publisher coordination uses generation-match conditional writes on the
+two mutable documents, which every GCS endpoint supports natively. The embedded
+snapshot manifest object is written last, so its presence commits a snapshot.
 
 The mirror can be deleted at any time. The next automatic refresh or explicit
 publication rebuilds it. Do not back it up, mount it as a Dag folder, or let any
@@ -118,10 +127,28 @@ uses them.
 The adapter does not create, replace, or delete source objects. A deployment system
 writes the Dag objects and optional marker.
 
-Dag processors with `auto_publish=false` need no Google connection or GCS
-permission. Workers that initialize pinned versions also need no GCS access. Those
-processes need read access to `published_root` and write access to their local
-Airflow bundle cache.
+## IAM for a gs:// published root
+
+A publisher needs, on the published-root bucket and prefix:
+
+```text
+storage.objects.create
+storage.objects.delete
+storage.objects.get
+```
+
+`storage.objects.delete` is required because GCS treats replacing an object as a
+delete plus a create, and every publication replaces the release reference and the
+auto-publish state document. The store never removes published objects; retention
+and cleanup of old versions is a deployment-side lifecycle concern.
+Generation-match preconditions need no extra permission. Consumers (explicit-mode
+dag processors and workers that initialize pinned versions) need only
+`storage.objects.get` on the releases prefix.
+
+With a filesystem `published_root`, dag processors with `auto_publish=false` need
+no Google connection or GCS permission, and workers that initialize pinned versions
+also need no GCS access. Those processes need read access to `published_root` and
+write access to their local Airflow bundle cache.
 
 ## Deployment boundary
 
@@ -182,7 +209,7 @@ Set `auto_publish` to `false` in the bundle configuration:
   "bucket_name": "airflow-dags",
   "prefix": "production/",
   "gcp_conn_id": "google_cloud_default",
-  "published_root": "/mnt/shared/airflow-bundles",
+  "published_root": "gs://airflow-dag-releases/releases",
   "deployment_marker_key": ".ready"
 }
 ```

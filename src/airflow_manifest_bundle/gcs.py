@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from airflow_manifest_bundle.bundle import FilesystemArtifactStore
+from airflow_manifest_bundle.gcs_store import normalized_gcs_api_endpoint
 from airflow_manifest_bundle.manifest import (
     BundleManifestError,
     BundleManifestNotFoundError,
@@ -42,11 +42,6 @@ DEFAULT_GCP_CONN_ID = (
 GCS_SOURCE_OBSERVATION_SCHEMA_VERSION = 1
 GCS_MIRROR_STATE_SCHEMA_VERSION = 1
 GCS_MIRROR_STATE_FILE_NAME = "_gcs_source_state.json"
-#: The library-default public endpoint. It is normalized out of the source
-#: identity so the identity of a default deployment never depends on how a
-#: particular google-cloud-storage release spells its internal endpoint
-#: attributes; only an explicitly configured custom endpoint differentiates.
-GCS_PUBLIC_API_ENDPOINT = "https://storage.googleapis.com"
 
 log = logging.getLogger(__name__)
 
@@ -89,8 +84,11 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
     Mirror a GCS folder into local staging and publish immutable snapshots.
 
     The GCS folder is the mutable source, never parsed or executed from directly.
-    Releases go to ``published_root``, which must be a durable shared filesystem
-    path: this adapter does not support object-store published roots yet.
+    Releases go to ``published_root``: a ``gs://`` prefix (recommended — pinned
+    execution then reads the releases prefix with the artifact store's GCS client),
+    or a shared filesystem path (pinned execution then needs no GCS access at all).
+    An ``s3://`` published_root is rejected: cross-cloud publication is not
+    supported.
 
     :param max_file_count: Maximum number of included objects in one source observation.
     :param max_file_size_bytes: Maximum size of one included object.
@@ -110,6 +108,7 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
     _observation_class = GCSSourceObservation
     _marker_key_requirement = "a non-empty relative GCS object name"
     _marker_key_safe_requirement = "a safe relative GCS object name"
+    _compatible_store_backends = ("filesystem", "gcs")
 
     def __init__(
         self,
@@ -136,13 +135,17 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
             auto_publish=auto_publish,
             **kwargs,
         )
-        if not isinstance(self._store, FilesystemArtifactStore):
-            raise TypeError(
-                "ManifestGCSDagBundle supports only a filesystem published_root; got "
-                f"{self.published_root!r}. Object-store published roots are not "
-                "supported for the GCS adapter yet."
-            )
         self.gcp_conn_id = gcp_conn_id
+        # Advisory for dag processors and publisher hosts only: pinned bundles are
+        # constructed for every task, and workers never publish.
+        if self.version is None and self._store.store_backend == "filesystem":
+            log.info(
+                "Bundle '%s' reads its Dag source from GCS but publishes releases to the "
+                "filesystem published_root %s. A gs:// published_root removes the shared "
+                "filesystem; see the GCS operator guide.",
+                self.name,
+                self.published_root,
+            )
         self._gcs_hook: Any | None = None
 
     @property
@@ -183,6 +186,24 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
             url += f"/{self.prefix}"
         return url
 
+    def _publish_copy_hints(
+        self, client: Any, observation: ObjectSourceObservation
+    ) -> Mapping[str, dict[str, Any]] | None:
+        # Transport hints for a gs:// published_root: each observed object, pinned to
+        # its generation, so the store can server-side rewrite instead of uploading
+        # the mirror bytes. Optimization only — any hint may fail back to upload.
+        endpoint = self._source_endpoint(client)
+        return {
+            entry.relative_path: {
+                "type": "gcs",
+                "endpoint": endpoint,
+                "bucket": self.bucket_name,
+                "name": entry.name,
+                "generation": entry.generation,
+            }
+            for entry in observation.entries
+        }
+
     def _validate_source_configuration(self, client: Any) -> None:
         try:
             client.get_bucket(self.bucket_name)
@@ -215,20 +236,7 @@ class ManifestGCSDagBundle(ObjectStoreSourceDagBundleBase):
     _get_gcs_client = _get_source_client
 
     def _source_endpoint(self, client: Any) -> str | None:
-        # Best effort only: these attributes are library internals, so the default
-        # endpoint must map to a stable value. A missing attribute and the public
-        # endpoint both become None; a configured custom endpoint stays visible.
-        connection = getattr(client, "_connection", None)
-        endpoint = getattr(connection, "API_BASE_URL", None)
-        if not isinstance(endpoint, str):
-            client_options = getattr(client, "_client_options", None)
-            endpoint = getattr(client_options, "api_endpoint", None)
-        if not isinstance(endpoint, str) or not endpoint:
-            return None
-        endpoint = endpoint.rstrip("/")
-        if endpoint == GCS_PUBLIC_API_ENDPOINT:
-            return None
-        return endpoint
+        return normalized_gcs_api_endpoint(client)
 
     def _list_source_objects(self, client: Any) -> Iterator[GCSObjectObservation]:
         listing_prefix = f"{self._normalized_prefix}/" if self._normalized_prefix else ""

@@ -31,6 +31,9 @@ safety argument.
 - `src/airflow_manifest_bundle/s3_store.py` — S3 implementation of the store contract
   for an `s3://` published_root: conditional-write (CAS) documents, manifest-last
   snapshot commits.
+- `src/airflow_manifest_bundle/gcs_store.py` — GCS implementation of the store
+  contract for a `gs://` published_root: generation-match CAS documents,
+  manifest-last snapshot commits.
 - `src/airflow_manifest_bundle/cli.py` — the `airflow-manifest-bundle` console script.
 - `src/airflow_manifest_bundle/_compat.py` — the only place that handles differences
   between Airflow releases.
