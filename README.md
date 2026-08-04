@@ -63,10 +63,11 @@ python -m pip install \
 ```
 
 The base package and explicit-mode GCS dag processors do not need the Google provider
-when they only consume releases from the filesystem `published_root`. Install the
-GCS extra on automatic dag processors and explicit GCS publisher hosts. The GCS
-adapter requires a filesystem `published_root`; it does not support an object-store
-published root yet.
+when they only consume releases from a filesystem `published_root`; hosts that read a
+`gs://` published root need the GCS extra. Install the GCS extra on automatic dag
+processors and explicit GCS publisher hosts. A GCS bundle publishes to a filesystem
+or `gs://` published root; cross-cloud pairings (a GCS source with an `s3://` root,
+or an S3 source with a `gs://` root) are rejected.
 
 The bundle requires Apache Airflow 3.0 or newer, detected at import time with no
 configuration: on Airflow 3.3+ `get_current_version` returns a `BundleVersion`; on
@@ -120,7 +121,8 @@ disposable local staging, but Airflow never parses or executes that mirror. See 
 [S3 operator guide](docs/s3.md) for the IAM matrix, deployment markers, retention
 lifecycle rules, and Object Lock guidance.
 
-For GCS, use the Google source adapter with a shared filesystem `published_root`:
+For GCS, use the Google source adapter with a `gs://` (or shared filesystem)
+`published_root`:
 
 ```ini
 [dag_processor]
@@ -132,7 +134,7 @@ dag_bundle_config_list = [
         "bucket_name": "airflow-dags",
         "prefix": "dags/",
         "gcp_conn_id": "google_cloud_default",
-        "published_root": "/shared/dag-releases",
+        "published_root": "gs://airflow-dag-releases/releases",
         "refresh_interval": 30,
         "deployment_marker_key": ".ready"
       }
@@ -147,8 +149,8 @@ Airflow's stock `GCSDagBundle`. See the [GCS operator guide](docs/gcs.md) for IA
 deployment-marker, mirror, and recovery guidance.
 
 With an object-store `published_root`, workers read only the releases prefix, and
-coordination uses conditional writes instead of a lock file — AWS S3 supports them;
-an S3-compatible store without `If-Match` support fails publication with a clear
+coordination uses conditional writes instead of a lock file — AWS S3 and GCS support
+them; an S3-compatible store without `If-Match` support fails publication with a clear
 error. The optional `published_root_conn_id` selects a separate AWS connection for
 the artifact store; it defaults to the store's standard connection resolution and is
 invalid for filesystem roots. When the source and the releases prefix share an S3
@@ -198,8 +200,9 @@ Keep these locations separate and non-overlapping:
 
 - **the Dag source** — a mutable local tree, S3 folder, or GCS folder, read by the publisher
 - **the object-source mirror** — disposable per-host staging used by the S3 or GCS adapter
-- **`published_root`** — the authoritative publication area: a shared filesystem path
-  or an `s3://` prefix, writable by publishers and readable by all Airflow components
+- **`published_root`** — the authoritative publication area: a shared filesystem path,
+  an `s3://` prefix, or a `gs://` prefix, writable by publishers and readable by all
+  Airflow components (cloud sources pair only with their own cloud's object store)
 - **`dag_bundle_storage_path`** — Airflow's disposable per-host cache
 
 Airflow always parses and executes the immutable snapshot, never the mutable source

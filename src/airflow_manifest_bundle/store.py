@@ -52,6 +52,11 @@ class ArtifactStore(ABC):
 
     bundle_name: str
 
+    #: Stable identifier of the storage backend ("filesystem", "s3", "gcs").
+    #: Source adapters use it to reject incompatible store pairings at construction
+    #: time without importing every store implementation.
+    store_backend: str
+
     #: Whether publishers can write releases through this store. A consume-only store
     #: keeps this False so adapters can reject publish configurations at construction
     #: time instead of failing on the first refresh.

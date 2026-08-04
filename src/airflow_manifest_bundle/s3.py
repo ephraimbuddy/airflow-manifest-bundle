@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from airflow_manifest_bundle.bundle import FilesystemArtifactStore
 from airflow_manifest_bundle.manifest import (
     BundleManifestError,
     BundleManifestNotFoundError,
@@ -99,6 +98,7 @@ class ManifestS3DagBundle(ObjectStoreSourceDagBundleBase):
     _observation_class = S3SourceObservation
     _marker_key_requirement = "a non-empty relative S3 key"
     _marker_key_safe_requirement = "a safe relative S3 object key"
+    _compatible_store_backends = ("filesystem", "s3")
 
     def __init__(
         self,
@@ -128,7 +128,7 @@ class ManifestS3DagBundle(ObjectStoreSourceDagBundleBase):
         self.aws_conn_id = aws_conn_id
         # Advisory for dag processors and publisher hosts only: pinned bundles are
         # constructed for every task, and workers never publish.
-        if self.version is None and isinstance(self._store, FilesystemArtifactStore):
+        if self.version is None and self._store.store_backend == "filesystem":
             log.info(
                 "Bundle '%s' reads its Dag source from S3 but publishes releases to the "
                 "filesystem published_root %s. An s3:// published_root removes the shared "
