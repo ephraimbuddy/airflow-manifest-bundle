@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-authors = [{ name = "Ephraim Anierobi", email = "ephraim@astronomer.io" }]
+authors = [{ name = "Ephraim Anierobi", email = "ephraimanierobi@gmail.com" }]
 keywords = ["airflow", "dag", "bundle", "deployment", "content-addressed", "manifest"]
 classifiers = [
     "Development Status :: 4 - Beta",
