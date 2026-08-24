@@ -46,6 +46,35 @@ version = "1.2.3"
     assert metadata == verify_release.ProjectMetadata(name="example-project", version="1.2.3")
 
 
+def test_verify_readme_version_accepts_the_release_version(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "AIRFLOW_VERSION=3.3.0\nAIRFLOW_MANIFEST_BUNDLE_VERSION=1.2.3\n",
+        encoding="utf-8",
+    )
+
+    verify_release.verify_readme_version(readme, "1.2.3")
+
+
+def test_verify_readme_version_rejects_a_stale_install_example(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("AIRFLOW_MANIFEST_BUNDLE_VERSION=1.2.2\n", encoding="utf-8")
+
+    with pytest.raises(verify_release.ReleaseVerificationError, match="1.2.2"):
+        verify_release.verify_readme_version(readme, "1.2.3")
+
+
+def test_verify_readme_version_requires_an_install_example(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("No install example here.\n", encoding="utf-8")
+
+    with pytest.raises(
+        verify_release.ReleaseVerificationError,
+        match="AIRFLOW_MANIFEST_BUNDLE_VERSION",
+    ):
+        verify_release.verify_readme_version(readme, "1.2.3")
+
+
 def test_create_artifact_directory_refuses_to_reuse_existing_directory(tmp_path):
     output_dir = tmp_path / "release"
     output_dir.mkdir()

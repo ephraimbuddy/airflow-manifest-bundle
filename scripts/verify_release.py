@@ -25,6 +25,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AIRFLOW_VERSION = "3.3.0"
 RELEASE_BRANCH = "main"
 RUFF_VERSION = "0.16.0"
+README_VERSION_PATTERN = re.compile(r"^AIRFLOW_MANIFEST_BUNDLE_VERSION=(\S+)", re.MULTILINE)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -97,6 +98,21 @@ def load_project_metadata(pyproject_path: Path) -> ProjectMetadata:
     if not isinstance(version, str) or not version:
         raise ReleaseVerificationError(f"{pyproject_path} does not contain a static project version")
     return ProjectMetadata(name=name, version=version)
+
+
+def verify_readme_version(readme_path: Path, version: str) -> None:
+    """Require every README install example to name the release version."""
+    declared = README_VERSION_PATTERN.findall(readme_path.read_text(encoding="utf-8"))
+    if not declared:
+        raise ReleaseVerificationError(
+            f"{readme_path} does not set AIRFLOW_MANIFEST_BUNDLE_VERSION in an install example"
+        )
+    stale = sorted({value for value in declared if value != version})
+    if stale:
+        raise ReleaseVerificationError(
+            f"{readme_path} installs AIRFLOW_MANIFEST_BUNDLE_VERSION={', '.join(stale)}, "
+            f"but the release version is {version}. Update the README install example."
+        )
 
 
 def require_tools() -> None:
@@ -390,6 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         require_tools()
         project = load_project_metadata(REPOSITORY_ROOT / "pyproject.toml")
+        verify_readme_version(REPOSITORY_ROOT / "README.md", project.version)
         tag = f"v{project.version}"
         commit = verify_git_state(tag)
         run_lint()
