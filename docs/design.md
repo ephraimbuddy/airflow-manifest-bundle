@@ -131,8 +131,9 @@ Each cloud-source mirror is a safe child of the Airflow bundle base folder.
 ## 7. Version identity
 
 The manifest records four values for each file: the relative path, the SHA-256 hash,
-the size, and the executable flag. The version is the SHA-256 hash of these entries
-in a canonical JSON form. Thus the version changes if, and only if, the content
+the size, and the executable flag. The version is the SHA-256 hash of a canonical JSON
+payload. The payload holds the manifest schema version and these four values for each
+file. Thus the version changes if, and only if, the file content or the schema version
 changes.
 
 The version string starts with `sha256-`. All characters in the string are safe in a
@@ -379,10 +380,11 @@ To make a cache copy, the bundle does these steps:
 ### 10.3 Pinned runs
 
 Airflow keeps the bundle version with each Dag run. When a task runs again, Airflow
-gives that version to the bundle. The bundle then uses the cache copy for that exact
-version. If Airflow deleted the cache copy, the bundle makes it again from the
-published root. The snapshot proves its own identity: its manifest must hash to the
-pinned version.
+gives that version to the bundle. Section 13 gives one exception: some Airflow
+releases move a cleared Dag run to the newest bundle version. The bundle then uses
+the cache copy for that exact version. If Airflow deleted the cache copy, the bundle
+makes it again from the published root. The snapshot proves its own identity: its
+manifest must hash to the pinned version.
 
 A pinned S3 bundle does not make an S3 hook. It does not check a bucket, list a
 prefix, read a mirror, read candidate state, or read the release reference. It needs
@@ -514,6 +516,12 @@ installed Airflow at import time:
   adapters examine it with a safe default.
 - On Airflow 3.0, callbacks run in the Dag processor with its bundle path. The
   callback behaviors in section 10.5 apply to Airflow 3.1 and later.
+- Airflow releases 3.0.2 through 3.0.x always move a cleared Dag run to the bundle
+  version that the Dag processor recorded last. Such a run thus uses the newest
+  release, not the release of its first attempt. Airflow 3.1 and later keep the pinned
+  version. They use the newest release only when the request, the Dag, or the
+  configuration asks for it. Retries, deferred tasks, and callbacks keep the pinned
+  version on every supported release.
 
 The S3 adapter requires `apache-airflow-providers-amazon` 9.10.0 or later. The
 `s3` optional dependency supplies this provider. The base package and local adapter

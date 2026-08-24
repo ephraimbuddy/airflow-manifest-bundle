@@ -20,6 +20,15 @@ requiring Git. They work like `GitDagBundle` does for commits:
 - Task retries and reruns **pin** through the existing `DagRun.bundle_version` field and
   rematerialize from the published root if the local cache was cleaned.
 
+One Airflow-core caveat applies to that pin. On Airflow 3.0.2 through 3.0.x, clearing a
+Dag run resets its `bundle_version` to the version the Dag processor recorded last, so a
+cleared run reruns on the newest release rather than the files it first used
+([apache/airflow#50040](https://github.com/apache/airflow/pull/50040)). Airflow 3.1 made
+that a choice — clearing keeps the pinned version unless the request asks for
+`run_on_latest_version` — and Airflow 3.3 added `[core] rerun_with_latest_version` as the
+deployment-wide default. Retries, deferred tasks, and callbacks pin on every supported
+Airflow version; only clearing is affected.
+
 ## Install
 
 Maintainers currently publish versioned wheels through

@@ -14,6 +14,8 @@ Before a release:
 
 - Install `uv` and the GitHub CLI (`gh`).
 - Authenticate the GitHub CLI with an account that has write access to the repository.
+- Update `[project].version` in `pyproject.toml` and the
+  `AIRFLOW_MANIFEST_BUNDLE_VERSION` value in the README install example.
 - Merge the version change into `main`.
 - Wait for all required CI checks on that commit to pass.
 - Configure Git to sign tags with the maintainer's signing key.
@@ -35,6 +37,7 @@ uv run scripts/verify_release.py
 The verification script:
 
 - reads the project name and version from `pyproject.toml`;
+- requires the README install example to name that version;
 - requires a clean `main` at the same commit as `origin/main`;
 - fetches tags and refuses to reuse an existing release tag;
 - checks Git tag-signing configuration and GitHub CLI authentication;

@@ -68,8 +68,11 @@ The manifest extensions are:
 
 `published_root` can be a durable shared filesystem path or a `gs://` URL. A
 `gs://` published root is recommended — pinned execution then reads the releases
-prefix directly and no shared filesystem is needed. An `s3://` published root is
-rejected at construction: cross-cloud publication is not supported. GCS is the
+prefix directly and no shared filesystem is needed. Use a filesystem path only for
+workers that must run without any cloud credentials; unlike S3-compatible stores,
+every GCS endpoint supports the conditional writes that publication needs, so that
+is never a reason to avoid a `gs://` root. An `s3://` published root is rejected at
+construction: cross-cloud publication is not supported. GCS is the
 mutable source in this adapter; the published root is the historical store that
 must retain every version Airflow can request. Keep the published root outside the
 source prefix — a separate bucket, or a disjoint prefix in the same bucket.
